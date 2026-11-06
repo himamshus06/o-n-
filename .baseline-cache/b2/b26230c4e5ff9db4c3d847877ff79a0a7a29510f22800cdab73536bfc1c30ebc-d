@@ -1,5 +1,0 @@
-./db.go
-./file_open_default.go
-./replace_windows.go
-./storage.go
-./storage_test.go

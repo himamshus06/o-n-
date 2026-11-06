@@ -6,9 +6,23 @@ recoveryprofile.exe
 kvdb
 kvdb-fault
 kvdb-enospc
+*.exe
+*.dll
+*.so
+*.dylib
+*.prof
+.go-tmp/
+.baseline-cache/
 *.kv
 *.cpu
 *.mem
+
+# Go test and benchmark outputs
+*.test
+*.bench
+coverage.out
+cover.out
+profile.out
 
 # Python bytecode and caches
 **/__pycache__/

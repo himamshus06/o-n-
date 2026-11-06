@@ -651,7 +651,33 @@ func (s *storage) check() error {
 	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	scanErr := s.scan(map[string]diskRecord{}, false)
+	var magic [8]byte
+	_, readErr := io.ReadFull(s.f, magic[:])
+	var scanErr error
+	switch {
+	case readErr == nil && string(magic[:]) == checkpointMagic:
+		// Reuse the authoritative checkpoint parser, then validate only the
+		// append-only records after the validated checkpoint boundary.
+		index := map[string]diskRecord{}
+		if _, err := s.f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		checkpointEnd, txID, err := s.loadCheckpoint(index)
+		if err != nil {
+			scanErr = err
+		} else {
+			scanErr = s.scanFrom(checkpointEnd, index, false, txID)
+		}
+	case readErr == nil:
+		// A non-checkpoint prefix is a legacy database. The legacy scanner
+		// remains responsible for its existing framing and validation rules.
+		scanErr = s.scan(map[string]diskRecord{}, false)
+	case readErr == io.EOF || readErr == io.ErrUnexpectedEOF:
+		// Preserve legacy behavior for empty or shorter-than-magic files.
+		scanErr = s.scan(map[string]diskRecord{}, false)
+	default:
+		scanErr = readErr
+	}
 	if _, err := s.f.Seek(0, io.SeekEnd); err != nil {
 		if scanErr != nil {
 			return fmt.Errorf("%v; restore file position: %w", scanErr, err)
