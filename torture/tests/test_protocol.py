@@ -4,6 +4,7 @@ import unittest
 from protocol import (
     Acknowledgement,
     BatchRequest,
+    CompactRequest,
     DeleteRequest,
     DumpRequest,
     DumpResponse,
@@ -56,6 +57,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(request_to_dict(GetRequest(2, b"k"))["op"], "GET")
         self.assertEqual(request_to_dict(DeleteRequest(3, b"k"))["op"], "DELETE")
         self.assertEqual(request_to_dict(DumpRequest(4))["op"], "DUMP")
+        self.assertEqual(request_to_dict(CompactRequest(5))["op"], "COMPACT")
 
     def test_batch_sizes_and_get_rejection(self):
         one = BatchRequest(1, (PutRequest(1, b"k", b"v"),))

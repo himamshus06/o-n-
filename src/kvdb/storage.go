@@ -89,28 +89,42 @@ type storage struct {
 func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, error) {
 	backup := path + ".compact-old"
 	tmp := path + ".compact-tmp"
-	pathValid, pathExists := validStorageCandidate(path)
-	backupValid, backupExists := validStorageCandidate(backup)
-	tmpValid, _ := validStorageCandidate(tmp)
-	if !pathExists || !pathValid {
-		if backupValid {
-			if pathExists {
-				_ = os.Remove(path)
+	_, pathErr := os.Stat(path)
+	_, backupErr := os.Stat(backup)
+	_, tmpErr := os.Stat(tmp)
+	pathExists := pathErr == nil
+	backupExists := backupErr == nil
+	tmpExists := tmpErr == nil
+	pathValid := true
+	// The normal case has one authoritative file and no replacement
+	// candidates. Let recover perform the single definitive validation pass;
+	// pre-validating here would rebuild the million-key checkpoint index twice.
+	// Candidate validation remains mandatory whenever replacement artifacts
+	// exist or the authoritative path is missing.
+	if !pathExists || backupExists || tmpExists {
+		pathValid, _ = validStorageCandidate(path)
+		backupValid, _ := validStorageCandidate(backup)
+		tmpValid, _ := validStorageCandidate(tmp)
+		if !pathExists || !pathValid {
+			if backupValid {
+				if pathExists {
+					_ = os.Remove(path)
+				}
+				if err := os.Rename(backup, path); err != nil {
+					return nil, nil, err
+				}
+				pathValid, pathExists = true, true
+			} else if !pathExists && tmpValid {
+				if err := os.Rename(tmp, path); err != nil {
+					return nil, nil, err
+				}
+				pathValid, pathExists = true, true
+			} else if pathExists {
+				// Keep an existing candidate selected when no validated backup is
+				// available so the normal recovery pass can report corruption or
+				// repair a physically incomplete tail.
+				pathValid = true
 			}
-			if err := os.Rename(backup, path); err != nil {
-				return nil, nil, err
-			}
-			pathValid, pathExists = true, true
-		} else if !pathExists && tmpValid {
-			if err := os.Rename(tmp, path); err != nil {
-				return nil, nil, err
-			}
-			pathValid, pathExists = true, true
-		} else if pathExists {
-			// Keep an existing candidate selected when no validated backup is
-			// available so the normal recovery pass can report corruption or
-			// repair a physically incomplete tail.
-			pathValid = true
 		}
 	}
 	if !pathExists {
@@ -119,7 +133,7 @@ func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, 
 	} else if !pathValid {
 		return nil, nil, fmt.Errorf("no valid authoritative database file")
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
+	f, err := openStorageFile(path, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -145,7 +159,7 @@ func validStorageCandidate(path string) (valid, exists bool) {
 	if _, err := os.Stat(path); err != nil {
 		return false, false
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0600)
+	f, err := openStorageFile(path, os.O_RDWR, 0600)
 	if err != nil {
 		return false, true
 	}
@@ -518,12 +532,6 @@ func writeFull(w io.Writer, b []byte) error {
 	return nil
 }
 
-func writeFull(w io.Writer, b []byte) (int, error) {
-	total := 0
-	for total < len(b) { n, err := w.Write(b[total:]); total += n; if err != nil { return total, err }; if n == 0 { return total, io.ErrShortWrite } }
-	return total, nil
-}
-
 func (s *storage) commit(ops []Operation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -674,7 +682,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 	compactionPoint("before-temp")
 	_ = os.Remove(tmp)
 	_ = os.Remove(backup)
-	tf, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	tf, err := openStorageFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
@@ -692,7 +700,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 		_ = os.Remove(tmp)
 		return err
 	}
-	validationFile, err := os.OpenFile(tmp, os.O_RDWR, 0600)
+	validationFile, err := openStorageFile(tmp, os.O_RDWR, 0600)
 	if err != nil {
 		_ = os.Remove(tmp)
 		return err
@@ -716,7 +724,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 	}
 	s.f = nil
 	if err = replaceAuthoritative(s.path, tmp, backup); err != nil {
-		s.f, _ = os.OpenFile(s.path, os.O_RDWR, 0600)
+		s.f, _ = openStorageFile(s.path, os.O_RDWR, 0600)
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -725,7 +733,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 		// The new file is complete and authoritative; retain it, but report the
 		// directory durability limitation to the caller.
 	}
-	newFile, err := os.OpenFile(s.path, os.O_RDWR, 0600)
+	newFile, err := openStorageFile(s.path, os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}

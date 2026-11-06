@@ -25,6 +25,7 @@ class Operation(str, Enum):
     DELETE = "DELETE"
     BATCH = "BATCH"
     DUMP = "DUMP"
+    COMPACT = "COMPACT"
 
 
 class Durability(str, Enum):
@@ -141,7 +142,19 @@ class DumpRequest:
         return {"id": self.request_id, "op": "DUMP"}
 
 
-Request: TypeAlias = PutRequest | GetRequest | DeleteRequest | BatchRequest | DumpRequest
+@dataclass(frozen=True, slots=True)
+class CompactRequest:
+    request_id: RequestId
+    operation: Operation = Operation.COMPACT
+
+    def __post_init__(self) -> None:
+        validate_request_id(self.request_id)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.request_id, "op": "COMPACT"}
+
+
+Request: TypeAlias = PutRequest | GetRequest | DeleteRequest | BatchRequest | DumpRequest | CompactRequest
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +241,8 @@ def request_from_dict(data: Mapping[str, Any]) -> Request:
             return DeleteRequest(request_id, decode_base64(data["key"], field="key", max_size=MAX_KEY_SIZE))
         if operation is Operation.DUMP:
             return DumpRequest(request_id)
+        if operation is Operation.COMPACT:
+            return CompactRequest(request_id)
         if operation is Operation.BATCH:
             raw_operations = data["operations"]
             if not isinstance(raw_operations, list) or not 1 <= len(raw_operations) <= MAX_BATCH_OPERATIONS:

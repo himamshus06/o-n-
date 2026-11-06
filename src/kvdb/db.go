@@ -25,16 +25,6 @@ type SpaceStats struct {
 	BytesReclaimed int64
 }
 
-type SpaceStats struct {
-	CurrentBytes int64
-	MaxBytes int64
-	LiveBytes int64
-	ObsoleteBytes int64
-	AvailableBytes int64
-	LastCompaction time.Time
-	BytesReclaimed int64
-}
-
 func Open(path string, maxBytes int64) (*DB, error) {
 	s, recovered, err := openStorage(path, maxBytes)
 	if err != nil {

@@ -1,20 +1,49 @@
-## Crash and transaction points
+# Crash points, recovery, and known weaknesses
 
-- Operation records may be present without a commit marker after a process crash. Recovery ignores those records.
-- The commit marker is synchronized before `Put`, `Delete`, or `Batch` returns successfully.
-- The in-memory index is updated only after synchronization succeeds.
-- A failed transaction is never applied to the index.
-- `Get` returns a copy of the stored value, so callers cannot mutate database state.
-- `Close` synchronizes before closing the file descriptor.
+## Write ordering
 
-The current implementation uses one process-wide writer lock per database instance. This favors clear atomic visibility over parallel write throughput.
+```text
+validate -> append operations -> append commit -> File.Sync()
+-> update map -> success/ACK
+```
 
-## Compaction, capacity, and concurrency
+The map is not updated before synchronization. A batch is not visible in an intermediate state. If rollback or rollback synchronization fails, storage is poisoned and writes are rejected with `ErrRecoveryRequired`. The JSONL layer reports an UNKNOWN outcome and stops serving normal requests.
 
-- Compaction blocks all DB reads and writes while it snapshots live values and replaces the log. This can pause service for the full rewrite duration.
-- The replacement protocol uses `.compact-tmp` and `.compact-old`. A crash with no base file restores the backup at next open. A stale temp is not considered authoritative.
-- File sync is required before installation. Directory sync is attempted where supported; Windows directory synchronization is not available through this implementation, so rename metadata persistence depends on the filesystem and OS.
-- Compaction can fail with `ErrMaxBytes` if the live set itself exceeds the configured file limit, or with OS errors such as ENOSPC while temporary space is unavailable. In either case the old log is retained.
-- Appends are rolled back to their original offset after record-write or sync errors. If truncation or rollback sync itself fails, the returned error includes that failure; recovery then depends on the underlying filesystem.
-- `SpaceStats` live and obsolete byte counts are estimates based on compacted record encoding, not allocated disk blocks.
-- Deterministic crash hooks and an atomic directory-handle replacement implementation are future work. Current tests cover compaction value preservation and capacity rejection, not process termination at each filesystem boundary.
+## Recovery behavior
+
+- Valid `KVCPv003` checkpoints load from offset zero.
+- Only newer committed JSON transactions replay.
+- Uncommitted groups are ignored.
+- Complete malformed records and checksum failures are rejected.
+- Physically incomplete final frames may be repaired.
+- Non-checkpoint files use legacy full-log recovery.
+
+## Tested crash/failure points
+
+Go tests cover short writes, operation-record failure, commit-marker failure, rollback failure, rollback-sync failure, transaction sync failure, incomplete-tail repair, checkpoint corruption/truncation, malformed post-checkpoint records, and compaction replacement boundaries through subprocess termination hooks. They also cover backup/temp-file recovery states.
+
+Actual Go executable tests cover process kill/restart, READY recovery, and survival of acknowledged data. They do not inject a real OS-level `File.Sync()` failure into the running serve process.
+
+## Theoretical or incomplete coverage
+
+These scenarios are reasoned about but are not equivalent to arbitrary power-loss testing:
+
+- Power loss while Windows directory metadata is being persisted.
+- Every internal byte-level step of `ReplaceFileW`.
+- Real disk-full behavior on the target filesystem.
+- A production serve-process sync failure caused by an OS or hardware fault.
+
+## Known weaknesses
+
+1. One-million-key checkpoint recovery measured approximately three seconds, above the two-second target.
+2. The active index is a copied `map[string][]byte`, not a physical record-location index.
+3. Windows directory-entry durability cannot be forced through the current portable implementation.
+4. The Python torture workflow does not issue compaction through JSONL.
+5. Race-detector validation is unavailable in the current environment because CGO/GCC is unavailable.
+6. The CLI does not persist `maxBytes` between independent commands.
+
+The JSONL protocol now includes the additive maintenance operation `COMPACT`. Existing CRUD, BATCH, GET, DELETE, and DUMP clients remain compatible.
+
+## Compaction
+
+Compaction synchronizes and independently validates `.compact-tmp`, then uses Windows `ReplaceFileW` or the portable fallback while retaining `.compact-old`. A missing authoritative path is restored from the backup during open. The backup is not an independent authority after successful recovery.
