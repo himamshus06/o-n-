@@ -8,11 +8,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
+	"time"
 )
 
 var ErrNotFound = errors.New("key not found")
 var ErrClosed = errors.New("database is closed")
+var ErrMaxBytes = errors.New("database size limit exceeded")
 
 type OperationType uint8
 
@@ -42,19 +45,34 @@ type storage struct {
 	f        *os.File
 	maxBytes int64
 	nextTx   uint64
+	path     string
+	lastCompaction time.Time
+	bytesReclaimed int64
 }
 
 func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, error) {
+	backup := path + ".compact-old"
+	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+		if _, backupErr := os.Stat(backup); backupErr == nil {
+			if err := os.Rename(backup, path); err != nil { return nil, nil, err }
+		}
+	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return nil, nil, err
 	}
-	s := &storage{f: f, maxBytes: maxBytes}
+	s := &storage{f: f, maxBytes: maxBytes, path: path}
+	// A backup is retained until the replacement has been installed and the
+	// directory entry synchronized. If the base is missing after a crash, it
+	// is the only known-good copy.
+	_ = os.Remove(path + ".compact-tmp")
 	committed := map[string]diskRecord{}
 	if err := s.recover(committed); err != nil {
 		f.Close()
 		return nil, nil, err
 	}
+	_ = os.Remove(backup)
+	_ = syncDir(filepath.Dir(path))
 	return s, committed, nil
 }
 
@@ -108,32 +126,91 @@ func (s *storage) appendLocked(rec diskRecord) error {
 	}
 	n := uint32(len(b))
 	if s.maxBytes > 0 {
-		st, _ := s.f.Stat()
+		st, e := s.f.Stat()
+		if e != nil { return e }
 		if st.Size()+int64(4+n) > s.maxBytes {
-			return fmt.Errorf("database size limit exceeded")
+			return ErrMaxBytes
 		}
 	}
-	if err = binary.Write(s.f, binary.LittleEndian, n); err != nil {
-		return err
-	}
-	_, err = s.f.Write(b)
+	frame := make([]byte, 4+len(b)); binary.LittleEndian.PutUint32(frame, n); copy(frame[4:], b)
+	_, err = writeFull(s.f, frame)
 	return err
+}
+
+func writeFull(w io.Writer, b []byte) (int, error) {
+	total := 0
+	for total < len(b) { n, err := w.Write(b[total:]); total += n; if err != nil { return total, err }; if n == 0 { return total, io.ErrShortWrite } }
+	return total, nil
 }
 
 func (s *storage) commit(ops []Operation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	start, err := s.f.Seek(0, io.SeekEnd); if err != nil { return err }
 	s.nextTx++
 	tx := s.nextTx
 	for _, op := range ops {
 		if err := s.appendLocked(diskRecord{TxID: tx, Type: op.Type, Key: append([]byte(nil), op.Key...), Value: append([]byte(nil), op.Value...)}); err != nil {
-			return err
+			return s.rollbackLocked(start, err)
 		}
 	}
 	if err := s.appendLocked(diskRecord{TxID: tx, Commit: true}); err != nil {
-		return err
+		return s.rollbackLocked(start, err)
 	}
-	return s.f.Sync()
+	if err := s.f.Sync(); err != nil { return s.rollbackLocked(start, err) }
+	return nil
+}
+
+func (s *storage) rollbackLocked(start int64, cause error) error {
+	if err := s.f.Truncate(start); err != nil { return fmt.Errorf("%w (rollback failed: %v)", cause, err) }
+	if _, err := s.f.Seek(0, io.SeekEnd); err != nil { return fmt.Errorf("%w (seek after rollback: %v)", cause, err) }
+	if err := s.f.Sync(); err != nil { return fmt.Errorf("%w (sync after rollback: %v)", cause, err) }
+	return cause
+}
+
+// compactLocked installs a complete replacement log while the caller holds
+// DB.mu exclusively. storage.mu excludes other file operations.
+func (s *storage) compactLocked(values map[string][]byte) error {
+	s.mu.Lock(); defer s.mu.Unlock()
+	tmp, backup := s.path+".compact-tmp", s.path+".compact-old"
+	_ = os.Remove(tmp)
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600); if err != nil { return err }
+	ok := false
+	defer func(){ f.Close(); if !ok { _ = os.Remove(tmp) } }()
+	var size int64; var tx uint64 = 1
+	for k, v := range values {
+		for _, rec := range []diskRecord{{TxID: tx, Type: Put, Key: []byte(k), Value: v}, {TxID: tx, Commit: true}} {
+			b, e := json.Marshal(rec); if e != nil { return e }; frame := make([]byte, 4+len(b)); binary.LittleEndian.PutUint32(frame, uint32(len(b))); copy(frame[4:], b)
+			if s.maxBytes > 0 && size+int64(len(frame)) > s.maxBytes { return ErrMaxBytes }
+			if _, e = writeFull(f, frame); e != nil { return e }; size += int64(len(frame))
+		}
+		tx++
+	}
+	if err = f.Sync(); err != nil { return err }
+	if _, _, err = openStorageCheck(f); err != nil { return fmt.Errorf("validate compacted file: %w", err) }
+	if err = f.Close(); err != nil { return err }
+	// The backup protocol works on Windows (Rename cannot replace an existing
+	// file) and POSIX. Open recovers the backup if a crash leaves no base file.
+	_ = os.Remove(backup)
+	if err = os.Rename(s.path, backup); err != nil { return err }
+	if err = os.Rename(tmp, s.path); err != nil { _ = os.Rename(backup, s.path); return err }
+	newFile, err := os.OpenFile(s.path, os.O_RDWR, 0600); if err != nil { return err }
+	old := s.f; s.f = newFile
+	oldInfo, _ := old.Stat(); oldSize := int64(0); if oldInfo != nil { oldSize = oldInfo.Size() }
+	s.nextTx = tx-1
+	s.lastCompaction = time.Now(); s.bytesReclaimed = oldSize-size
+	if err = syncDir(filepath.Dir(s.path)); err != nil { _ = old.Close(); return err }
+	if err = old.Close(); err != nil { return err }
+	_ = os.Remove(backup)
+	_ = syncDir(filepath.Dir(s.path))
+	ok = true
+	return nil
+}
+
+func syncDir(dir string) error {
+	if os.PathSeparator == '\\' { return nil }
+	f, err := os.Open(dir); if err != nil { return err }; defer f.Close()
+	if err = f.Sync(); err != nil { return err }; return nil
 }
 
 func (s *storage) close() error {

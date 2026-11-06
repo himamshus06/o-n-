@@ -1,8 +1,10 @@
 package kvdb
 
 import (
+	"encoding/json"
 	"sort"
 	"sync"
+	"time"
 )
 
 type DB struct {
@@ -10,6 +12,16 @@ type DB struct {
 	storage *storage
 	values  map[string][]byte
 	closed  bool
+}
+
+type SpaceStats struct {
+	CurrentBytes int64
+	MaxBytes int64
+	LiveBytes int64
+	ObsoleteBytes int64
+	AvailableBytes int64
+	LastCompaction time.Time
+	BytesReclaimed int64
 }
 
 func Open(path string, maxBytes int64) (*DB, error) {
@@ -79,6 +91,34 @@ func (db *DB) Keys() map[string][]byte {
 		out[k] = append([]byte(nil), v...)
 	}
 	return out
+}
+
+// Compact rewrites the committed live values into a new log. It blocks DB
+// readers and writers while taking the snapshot and installing the file.
+func (db *DB) Compact() error {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	if db.closed { return ErrClosed }
+	return db.storage.compactLocked(db.values)
+}
+
+// SpaceStats reports file and estimated live-data usage.
+func (db *DB) SpaceStats() (SpaceStats, error) {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	if db.closed { return SpaceStats{}, ErrClosed }
+	db.storage.mu.Lock(); defer db.storage.mu.Unlock()
+	st, err := db.storage.f.Stat(); if err != nil { return SpaceStats{}, err }
+	var live int64
+	for k, v := range db.values {
+		for _, rec := range []diskRecord{{TxID: 1, Type: Put, Key: []byte(k), Value: v}, {TxID: 1, Commit: true}} {
+			b, e := json.Marshal(rec); if e != nil { return SpaceStats{}, e }; live += int64(4+len(b))
+		}
+	}
+	stats := SpaceStats{CurrentBytes: st.Size(), MaxBytes: db.storage.maxBytes, LiveBytes: live, ObsoleteBytes: st.Size()-live, LastCompaction: db.storage.lastCompaction, BytesReclaimed: db.storage.bytesReclaimed}
+	if stats.ObsoleteBytes < 0 { stats.ObsoleteBytes = 0 }
+	if stats.MaxBytes > 0 { stats.AvailableBytes = stats.MaxBytes-st.Size(); if stats.AvailableBytes < 0 { stats.AvailableBytes = 0 } }
+	return stats, nil
 }
 func (db *DB) Check() error {
 	db.mu.RLock()
