@@ -89,28 +89,42 @@ type storage struct {
 func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, error) {
 	backup := path + ".compact-old"
 	tmp := path + ".compact-tmp"
-	pathValid, pathExists := validStorageCandidate(path)
-	backupValid, backupExists := validStorageCandidate(backup)
-	tmpValid, _ := validStorageCandidate(tmp)
-	if !pathExists || !pathValid {
-		if backupValid {
-			if pathExists {
-				_ = os.Remove(path)
+	_, pathErr := os.Stat(path)
+	_, backupErr := os.Stat(backup)
+	_, tmpErr := os.Stat(tmp)
+	pathExists := pathErr == nil
+	backupExists := backupErr == nil
+	tmpExists := tmpErr == nil
+	pathValid := true
+	// The normal case has one authoritative file and no replacement
+	// candidates. Let recover perform the single definitive validation pass;
+	// pre-validating here would rebuild the million-key checkpoint index twice.
+	// Candidate validation remains mandatory whenever replacement artifacts
+	// exist or the authoritative path is missing.
+	if !pathExists || backupExists || tmpExists {
+		pathValid, _ = validStorageCandidate(path)
+		backupValid, _ := validStorageCandidate(backup)
+		tmpValid, _ := validStorageCandidate(tmp)
+		if !pathExists || !pathValid {
+			if backupValid {
+				if pathExists {
+					_ = os.Remove(path)
+				}
+				if err := os.Rename(backup, path); err != nil {
+					return nil, nil, err
+				}
+				pathValid, pathExists = true, true
+			} else if !pathExists && tmpValid {
+				if err := os.Rename(tmp, path); err != nil {
+					return nil, nil, err
+				}
+				pathValid, pathExists = true, true
+			} else if pathExists {
+				// Keep an existing candidate selected when no validated backup is
+				// available so the normal recovery pass can report corruption or
+				// repair a physically incomplete tail.
+				pathValid = true
 			}
-			if err := os.Rename(backup, path); err != nil {
-				return nil, nil, err
-			}
-			pathValid, pathExists = true, true
-		} else if !pathExists && tmpValid {
-			if err := os.Rename(tmp, path); err != nil {
-				return nil, nil, err
-			}
-			pathValid, pathExists = true, true
-		} else if pathExists {
-			// Keep an existing candidate selected when no validated backup is
-			// available so the normal recovery pass can report corruption or
-			// repair a physically incomplete tail.
-			pathValid = true
 		}
 	}
 	if !pathExists {
