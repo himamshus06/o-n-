@@ -42,6 +42,24 @@ from workload import WorkloadConfig, WorkloadGenerator
 
 ENOSPC_BATCH_VALUE_SIZE = 256 * 1024
 ENOSPC_BATCH_BUDGET = 400_000
+PERMANENTLY_UNTESTED = (
+    "physical disk exhaustion",
+    "linearizability checking",
+)
+LEGACY_MODE_NOT_TESTED_LABELS = {
+    "recovery-crash mode",
+    "disk-full/ENOSPC mode",
+}
+EXPECTED_MODE_CASES = {
+    "recovery-crash": {
+        "recovery-started-recovery-crash",
+        "recovery-transaction-applied-recovery-crash",
+    },
+    "injected-enospc": {
+        "injected-enospc",
+        "injected-enospc-batch-atomicity",
+    },
+}
 
 
 @dataclass
@@ -68,6 +86,83 @@ class CampaignReport:
     crash_events: list[dict[str, object]] = field(default_factory=list)
     finished_utc: str = ""
     duration_seconds: float = 0.0
+
+
+def finalize_not_tested(report: CampaignReport) -> None:
+    """Keep only real capability gaps and specific execution blockers."""
+    entries = list(PERMANENTLY_UNTESTED)
+    entries.extend(
+        item
+        for item in report.not_tested
+        if item not in LEGACY_MODE_NOT_TESTED_LABELS
+        and item not in PERMANENTLY_UNTESTED
+    )
+    passed = set(report.passed)
+    failed_modes = {
+        str(failure.get("mode", "")) for failure in report.failed
+    }
+    for mode in report.modes:
+        expected = EXPECTED_MODE_CASES.get(mode)
+        if not expected:
+            continue
+        missing = sorted(expected - passed)
+        if not missing or any(
+            mode in failed_mode or mode in item
+            for failed_mode in failed_modes
+            for item in entries
+        ):
+            continue
+        if any(item.startswith(f"{mode}:") for item in entries):
+            continue
+        entries.append(f"{mode}: cases not executed: {', '.join(missing)}")
+    report.not_tested = list(dict.fromkeys(entries))
+
+
+def render_markdown(report: CampaignReport) -> str:
+    """Render the finalized report without recalculating any campaign data."""
+    markdown = [
+        "# Kill It and Prove It campaign",
+        "",
+        f"Started UTC: `{report.started_utc}`",
+        f"Finished UTC: `{report.finished_utc}`",
+        f"Seed: `{report.seed}`",
+        f"Iterations: `{report.iterations}`",
+        f"Duration seconds: `{report.duration_seconds:.3f}`",
+        "",
+        "## Modes",
+        *[f"- {item}" for item in report.modes],
+        "",
+        "## Passed",
+        *[f"- {item}" for item in report.passed],
+        "",
+        "## Failed",
+        *[f"- {item['mode']}: {item['error']}" for item in report.failed],
+        "",
+        "## Not tested",
+        *[f"- {item}" for item in report.not_tested],
+        "",
+        "## Simulated only",
+        *[f"- {item}" for item in report.simulated_only],
+        "",
+        "## Environment blocked",
+        *[f"- {item}" for item in report.environment_blocked],
+        "",
+        "## Metrics",
+        f"- Operations attempted: {report.operations_attempted}",
+        f"- Acknowledged writes: {report.acknowledged_writes}",
+        f"- Failed operations: {report.failed_operations}",
+        f"- UNKNOWN outcomes: {report.unknown_outcomes}",
+        f"- Crashes: {report.crashes}",
+        f"- Restarts: {report.restarts}",
+        f"- Recovery failures: {report.recovery_failures}",
+        f"- Oracle mismatches: {report.oracle_mismatches}",
+        f"- Integrity-check failures: {report.integrity_check_failures}",
+        f"- Batch-atomicity failures: {report.batch_atomicity_failures}",
+        "",
+        "## Crash events",
+        *[f"- {json.dumps(item, sort_keys=True)}" for item in report.crash_events],
+    ]
+    return "\n".join(markdown) + "\n"
 
 
 def _executable(value: str | None) -> Path:
@@ -672,11 +767,7 @@ def main() -> int:
         modes=modes,
         passed=[],
         failed=[],
-        not_tested=[
-            "recovery-crash mode",
-            "disk-full/ENOSPC mode",
-            "linearizability checking",
-        ],
+        not_tested=list(PERMANENTLY_UNTESTED),
         simulated_only=[],
         environment_blocked=[],
         crash_events=[],
@@ -725,37 +816,10 @@ def main() -> int:
         datetime.fromisoformat(report.finished_utc).timestamp()
         - datetime.fromisoformat(report.started_utc).timestamp()
     )
+    finalize_not_tested(report)
     args.json_report.write_text(json.dumps(asdict(report), indent=2), encoding="utf-8")
-    markdown = [
-        "# Kill It and Prove It campaign",
-        "",
-        f"Seed: `{report.seed}`",
-        f"Iterations: `{report.iterations}`",
-        f"Duration seconds: `{report.duration_seconds:.3f}`",
-        "",
-        "## Passed",
-        *[f"- {item}" for item in report.passed],
-        "",
-        "## Failed",
-        *[f"- {item['mode']}: {item['error']}" for item in report.failed],
-        "",
-        "## Not tested",
-        *[f"- {item}" for item in report.not_tested],
-        "",
-        "## Environment blocked",
-        *[f"- {item}" for item in report.environment_blocked],
-        "",
-        "## Metrics",
-        f"- Operations attempted: {report.operations_attempted}",
-        f"- Acknowledged writes: {report.acknowledged_writes}",
-        f"- UNKNOWN outcomes: {report.unknown_outcomes}",
-        f"- Crashes: {report.crashes}",
-        f"- Restarts: {report.restarts}",
-        f"- Recovery failures: {report.recovery_failures}",
-        f"- Oracle mismatches: {report.oracle_mismatches}",
-    ]
     args.json_report.with_suffix(".md").write_text(
-        "\n".join(markdown) + "\n", encoding="utf-8"
+        render_markdown(report), encoding="utf-8"
     )
     print(json.dumps(asdict(report), indent=2))
     return 1 if report.failed else 0
