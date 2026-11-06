@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
@@ -557,5 +558,118 @@ func TestRecoverySelectsOnlyValidatedCandidates(t *testing.T) {
 				t.Fatalf("backup remained authoritative after %s", state)
 			}
 		})
+	}
+}
+
+func TestCheckpointValidationAndLegacyDetection(t *testing.T) {
+	base, err := makeCheckpoint(map[string][]byte{"a": []byte("1")}, 7, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string][]byte{
+		"checksum corruption":  append([]byte(nil), base...),
+		"truncated checkpoint": base[:len(base)-1],
+		"unknown magic":        append([]byte("UNKNOWN!"), base[8:]...),
+	}
+	tests["checksum corruption"][20] ^= 1
+	for name, data := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "db.kv")
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := openStorage(path, 0); err == nil {
+				t.Fatal("corrupt checkpoint was accepted")
+			}
+		})
+	}
+	t.Run("short checkpoint header", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "db.kv")
+		if err := os.WriteFile(path, []byte("KVCPv003"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := openStorage(path, 0); err == nil {
+			t.Fatal("short checkpoint was accepted")
+		}
+	})
+	t.Run("oversized payload", func(t *testing.T) {
+		data := make([]byte, checkpointHeaderSize+checkpointTrailerSize)
+		copy(data[:8], checkpointMagic)
+		binary.LittleEndian.PutUint16(data[8:10], 3)
+		binary.LittleEndian.PutUint16(data[10:12], checkpointHeaderSize)
+		binary.LittleEndian.PutUint64(data[12:20], 1)
+		binary.LittleEndian.PutUint64(data[20:28], 1)
+		binary.LittleEndian.PutUint64(data[28:36], 1)
+		binary.LittleEndian.PutUint64(data[36:44], maxCheckpointSize+1)
+		binary.LittleEndian.PutUint32(data[48:52], crc32.Checksum(data[:48], castagnoliTable))
+		path := filepath.Join(t.TempDir(), "db.kv")
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := openStorage(path, 0); err == nil {
+			t.Fatal("oversized checkpoint was accepted")
+		}
+	})
+}
+
+func TestCheckpointReplayBoundaryAndMalformedTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.kv")
+	db, err := Open(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Batch([]Operation{{Type: Put, Key: []byte("old"), Value: []byte("1")}, {Type: Put, Key: []byte("gone"), Value: []byte("x")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Delete([]byte("gone")); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Batch([]Operation{{Type: Put, Key: []byte("new"), Value: []byte("2")}, {Type: Delete, Key: []byte("old")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = reopened.Get([]byte("old")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old key survived: %v", err)
+	}
+	if _, err = reopened.Get([]byte("gone")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted key resurrected: %v", err)
+	}
+	if v, e := reopened.Get([]byte("new")); e != nil || string(v) != "2" {
+		t.Fatalf("new key missing: %q %v", v, e)
+	}
+	reopened.Close()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, 4, 0, 0, 0, '{', 'b', 'a', 'd')
+	if err = os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = Open(path, 0); err == nil {
+		t.Fatal("complete malformed post-checkpoint record was ignored")
+	}
+}
+
+func TestCheckpointMillionEntryCount(t *testing.T) {
+	values := make(map[string][]byte, 1_000_000)
+	for i := 0; i < 1_000_000; i++ {
+		values[fmt.Sprintf("k%07d", i)] = []byte("v")
+	}
+	frame, err := makeCheckpoint(values, 9, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frame) == 0 {
+		t.Fatal("empty checkpoint")
 	}
 }
