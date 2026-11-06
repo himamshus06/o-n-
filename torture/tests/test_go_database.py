@@ -75,7 +75,11 @@ class GoDatabaseIntegrationTests(unittest.TestCase):
         delete = DeleteRequest("delete", b"delete")
         self.assertEqual(self.adapter.send_request(delete), Acknowledgement("delete"))
         oracle.apply_delete(b"delete")
-        self.assertEqual(self.adapter.send_request(CompactRequest("compact-1")), Acknowledgement("compact-1"))
+        response = self.adapter.send_request(CompactRequest("compact-1"))
+        print("\nCOMPACTION RESPONSE:", repr(response))
+        self.assertEqual(
+        response,
+        Acknowledgement("compact-1"))
         oracle.verify_dump(self.adapter.send_request(DumpRequest("after-compact")))
         followup = PutRequest("followup", b"after", b"compact")
         self.assertEqual(self.adapter.send_request(followup), Acknowledgement("followup"))

@@ -3,6 +3,9 @@ kvdb.exe
 kvdb-report-check.exe
 recoverybench.exe
 recoveryprofile.exe
+kvdb
+kvdb-fault
+kvdb-enospc
 *.kv
 *.cpu
 *.mem
@@ -10,3 +13,20 @@ recoveryprofile.exe
 # Python bytecode and caches
 **/__pycache__/
 *.py[cod]
+.pytest_cache/
+
+# Python virtual environments
+.venv/
+.venv-wsl/
+venv/
+env/
+ENV/
+
+# Logs and temporary/editor files
+*.log
+*.tmp
+*.temp
+*~
+*.swp
+*.swo
+.#*

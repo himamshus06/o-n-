@@ -1,0 +1,8 @@
+{
+  "recovery_started_exit": 0,
+  "recovery_started_check": "OK",
+  "recovery_started_dump": "a 1 b 2",
+  "recovery_applied_exit": 0,
+  "recovery_applied_check": "OK",
+  "recovery_applied_dump": "a 1 b 2"
+}

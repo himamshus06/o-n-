@@ -33,6 +33,86 @@ $env:PYTHONPATH = "torture"
 python -m pytest torture/tests -v
 ```
 
+### Bounded real-binary campaign
+
+Run a bounded campaign against an already-built executable:
+
+``` powershell
+.\torture\quick-campaign.ps1 -Executable .\kvdb-baseline.exe -Seed 424242 -Operations 250
+```
+
+It uses fresh temporary databases and writes `artifacts/quick-campaign.json`
+and `artifacts/quick-campaign.md`. It checks CRUD, arbitrary bytes, an
+independent map oracle, deterministic randomized workloads, batches,
+compaction, restart/recovery, and malformed-input protocol continuity.
+Precise in-flight crash boundaries, race freedom, linearizability, power-loss,
+and ENOSPC remain unverified unless an instrumented executable and isolated
+filesystem are supplied.
+
+For deterministic process-kill boundaries, batch atomicity, compaction
+interruption, four 1,000-operation seeds, and the existing Go concurrency
+stress test, run:
+
+``` powershell
+.\torture\advanced-campaign.ps1 -Operations 1000
+```
+
+This builds a disposable `kvdb_faultinject` executable and writes
+`artifacts/advanced-campaign.json` and `artifacts/advanced-campaign.md`.
+The fault hooks are disabled in normal builds. See
+`artifacts/final-report.md` for the claim boundaries and blocked environments.
+
+The unified Python campaign entry point uses the problem-statement default of
+500 iterations and supports a user seed:
+
+``` powershell
+$env:PYTHONPATH = "torture"
+python -m campaign --seed 424242 --iterations 500 --mode default
+python -m campaign --seed 424242 --mode large-value --mode large-batch --mode concurrent-writers
+```
+
+Crash, recovery-interruption, compaction-interruption, and deterministic
+injected-ENOSPC modes are separate real-binary modes. They remain distinct from
+simulator-only faults and from physical disk exhaustion.
+
+### WSL Ubuntu validation
+
+From WSL Ubuntu, with the repository available at `/mnt/d/Srinivas`:
+
+```bash
+sudo apt update
+sudo apt install -y golang python3 python3-venv build-essential
+cd /mnt/d/Srinivas
+go version
+python3 --version
+go build -o kvdb ./src/cmd/kvdb
+go build -tags kvdb_faultinject -o kvdb-fault ./src/cmd/kvdb
+go build -tags kvdb_enospc -o kvdb-enospc ./src/cmd/kvdb
+python3 -m venv .venv-wsl
+. .venv-wsl/bin/activate
+python -m pip install --upgrade pip pytest
+PYTHONPATH=torture python -m unittest discover tests -v
+PYTHONPATH=torture python -m unittest discover torture/tests -v
+PYTHONPATH=torture python -m campaign \
+  --executable ./kvdb \
+  --fault-executable ./kvdb-fault \
+  --seed 424242 --iterations 500 --mode default
+PYTHONPATH=torture python -m campaign \
+  --executable ./kvdb \
+  --fault-executable ./kvdb-fault \
+  --seed 424242 \
+  --mode random-crash --mode recovery-crash --mode compaction-crash \
+  --mode large-value --mode large-batch --mode concurrent-writers
+KVDB_ENOSPC_EXECUTABLE="$PWD/kvdb-enospc" \
+  PYTHONPATH=torture python -m campaign \
+  --executable ./kvdb --mode injected-enospc
+```
+
+The campaign writes JSON and Markdown reports beside the requested JSON path.
+The ENOSPC mode above is deterministic injected ENOSPC, not a claim about
+physical disk exhaustion. Use `go test -race ./...` separately when the WSL
+toolchain has a working C compiler.
+
 This Python regression suite is distinct from the randomized
 crash-torture runner described by the project requirements. Passing the
 regression suite does not establish that the full randomized torture

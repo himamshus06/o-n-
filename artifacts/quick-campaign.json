@@ -1,0 +1,36 @@
+{
+  "started_utc": "2026-11-06T17:35:28.4243386Z",
+  "executable": "D:\\Srinivas\\kvdb-baseline.exe",
+  "seed": 424242,
+  "operations": 250,
+  "categories": {
+    "crud-and-oracle": {
+      "executed": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "deterministic-random": {
+      "executed": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "batch-compaction-restart": {
+      "executed": 1,
+      "passed": 1,
+      "failed": 0
+    },
+    "protocol-malformed-input": {
+      "executed": 1,
+      "passed": 1,
+      "failed": 0
+    }
+  },
+  "failures": [],
+  "skipped": [
+    "precise in-flight write/commit crash boundaries: no instrumented build supplied",
+    "race detector and linearizability: not applicable to this sequential quick campaign",
+    "power-loss and ENOSPC: not safely reproducible on the host volume"
+  ],
+  "finished_utc": "2026-11-06T17:35:28.9586150Z",
+  "total_failed": 0
+}
