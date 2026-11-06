@@ -3,8 +3,8 @@ package main
 import (
 	"bufio"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
-	"io"
 	"killitandproveit/src/kvdb"
 	"os"
 	"strconv"
@@ -177,46 +177,221 @@ func serve(a []string) {
 		return
 	}
 	defer db.Close()
+	out := bufio.NewWriter(os.Stdout)
+	defer out.Flush()
+	fmt.Fprintln(os.Stderr, "READY")
 	s := bufio.NewScanner(os.Stdin)
+	s.Buffer(make([]byte, 64*1024), 4<<20)
 	for s.Scan() {
-		p := strings.SplitN(s.Text(), " ", 4)
-		if len(p) < 3 {
+		var req serveRequest
+		if err := json.Unmarshal(s.Bytes(), &req); err != nil {
+			writeServeResponse(out, serveResponse{Status: "ERROR", Error: "Invalid JSON"})
 			continue
 		}
-		id, op := p[0], strings.ToUpper(p[1])
-		var err error
+		var fields map[string]json.RawMessage
+		_ = json.Unmarshal(s.Bytes(), &fields)
+		if err := validateID(req.ID); err != nil {
+			writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: err.Error()})
+			continue
+		}
+		if req.Op == "" {
+			writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: "Missing operation"})
+			continue
+		}
+		op := strings.ToUpper(req.Op)
 		switch op {
-		case "PUT":
-			if len(p) < 4 {
-				err = fmt.Errorf("missing value")
-			} else {
-				v, _ := base64.StdEncoding.DecodeString(p[3])
-				k, _ := base64.StdEncoding.DecodeString(p[2])
-				err = db.Put(k, v)
-			}
-		case "GET":
-			k, _ := base64.StdEncoding.DecodeString(p[2])
-			var v []byte
-			v, err = db.Get(k)
-			if err == nil {
-				fmt.Printf("VALUE %s %s\n", id, base64.StdEncoding.EncodeToString(v))
+		case "PUT", "GET", "DELETE":
+			if err := validateEncodedKey(req.Key); err != nil {
+				writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: err.Error()})
 				continue
 			}
-		case "DELETE":
-			k, _ := base64.StdEncoding.DecodeString(p[2])
-			err = db.Delete(k)
+			key, _ := base64.StdEncoding.DecodeString(req.Key)
+			if op == "GET" {
+				value, err := db.Get(key)
+				if err == kvdb.ErrNotFound {
+					writeServeResponse(out, serveResponse{ID: req.ID, Status: "NOT_FOUND"})
+				} else if err != nil {
+					if !writeServeError(out, req.ID, err) {
+						return
+					}
+				} else {
+					writeServeResponse(out, serveResponse{ID: req.ID, Status: "VALUE", Value: base64.StdEncoding.EncodeToString(value)})
+				}
+				continue
+			}
+			if op == "PUT" {
+				if _, ok := fields["value"]; !ok {
+					writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: "Missing value"})
+					continue
+				}
+				if err := validateEncodedValue(req.Value); err != nil {
+					writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: err.Error()})
+					continue
+				}
+				value, _ := base64.StdEncoding.DecodeString(req.Value)
+				if err := db.Put(key, value); err != nil {
+					if !writeServeError(out, req.ID, err) {
+						return
+					}
+				} else {
+					writeServeResponse(out, serveResponse{ID: req.ID, Status: "ACK"})
+				}
+			} else {
+				if err := db.Delete(key); err != nil {
+					if !writeServeError(out, req.ID, err) {
+						return
+					}
+				} else {
+					writeServeResponse(out, serveResponse{ID: req.ID, Status: "ACK"})
+				}
+			}
+		case "BATCH":
+			ops, err := decodeBatch(req.Operations)
+			if err != nil {
+				writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: err.Error()})
+				continue
+			}
+			if err = db.Batch(ops); err != nil {
+				if !writeServeError(out, req.ID, err) {
+					return
+				}
+			} else {
+				writeServeResponse(out, serveResponse{ID: req.ID, Status: "ACK"})
+			}
+		case "DUMP":
+			entries := make([]serveEntry, 0)
+			values := db.Keys()
+			for _, key := range kvdb.SortedKeys(values) {
+				entries = append(entries, serveEntry{Key: base64.StdEncoding.EncodeToString([]byte(key)), Value: base64.StdEncoding.EncodeToString(values[key])})
+			}
+			writeServeResponse(out, serveResponse{ID: req.ID, Status: "DUMP", Entries: entries})
 		default:
-			err = fmt.Errorf("unknown operation")
+			writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: "Invalid operation"})
 		}
-		if err == kvdb.ErrNotFound {
-			fmt.Printf("NOTFOUND %s\n", id)
-		} else if err != nil {
-			fmt.Printf("ERROR %s %s\n", id, strings.ReplaceAll(err.Error(), " ", "_"))
+	}
+	if err := s.Err(); err != nil {
+		fmt.Fprintf(os.Stderr, "stdin: %v\n", err)
+	}
+}
+
+type serveRequest struct {
+	ID         json.RawMessage       `json:"id"`
+	Op         string                `json:"op"`
+	Key        string                `json:"key"`
+	Value      string                `json:"value"`
+	Operations []serveBatchOperation `json:"operations"`
+}
+type serveBatchOperation struct {
+	Op    string  `json:"op"`
+	Key   string  `json:"key"`
+	Value *string `json:"value"`
+}
+type serveEntry struct {
+	Key   string `json:"key"`
+	Value string `json:"value"`
+}
+type serveResponse struct {
+	ID      json.RawMessage `json:"id,omitempty"`
+	Status  string          `json:"status"`
+	Value   string          `json:"value,omitempty"`
+	Error   string          `json:"error,omitempty"`
+	Outcome string          `json:"outcome,omitempty"`
+	Entries []serveEntry    `json:"entries"`
+}
+
+func writeServeResponse(w *bufio.Writer, response serveResponse) {
+	b, _ := json.Marshal(response)
+	_, _ = w.Write(append(b, '\n'))
+	_ = w.Flush()
+}
+func writeServeError(w *bufio.Writer, id json.RawMessage, err error) bool {
+	if err == kvdb.ErrRecoveryRequired || (dbRecoveryError(err)) {
+		writeServeResponse(w, serveResponse{ID: id, Status: "ERROR", Outcome: "UNKNOWN", Error: "Commit outcome uncertain; database requires recovery"})
+		return false
+	}
+	writeServeResponse(w, serveResponse{ID: id, Status: "ERROR", Error: err.Error()})
+	return true
+}
+func dbRecoveryError(err error) bool { return strings.Contains(err.Error(), "requires recovery") }
+func validateID(raw json.RawMessage) error {
+	if len(raw) == 0 || string(raw) == "null" {
+		return fmt.Errorf("Missing id")
+	}
+	var v any
+	d := json.NewDecoder(strings.NewReader(string(raw)))
+	d.UseNumber()
+	if err := d.Decode(&v); err != nil {
+		return fmt.Errorf("Invalid id")
+	}
+	switch x := v.(type) {
+	case string:
+		if x == "" {
+			return fmt.Errorf("Invalid id")
+		}
+	case json.Number:
+		if _, err := x.Int64(); err != nil {
+			return fmt.Errorf("Invalid id")
+		}
+	default:
+		return fmt.Errorf("Invalid id")
+	}
+	return nil
+}
+func validateEncodedKey(s string) error {
+	if s == "" {
+		return fmt.Errorf("Missing key")
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return fmt.Errorf("Invalid Base64 key")
+	}
+	if len(b) > 1024 {
+		return fmt.Errorf("key exceeds 1024 bytes")
+	}
+	return nil
+}
+func validateEncodedValue(s string) error {
+	if s == "" {
+		return fmt.Errorf("Missing value")
+	}
+	b, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return fmt.Errorf("Invalid Base64 value")
+	}
+	if len(b) > 1<<20 {
+		return fmt.Errorf("value exceeds 1 MB")
+	}
+	return nil
+}
+func decodeBatch(items []serveBatchOperation) ([]kvdb.Operation, error) {
+	if len(items) > 10000 {
+		return nil, fmt.Errorf("batch exceeds 10000 operations")
+	}
+	ops := make([]kvdb.Operation, 0, len(items))
+	for _, item := range items {
+		op := strings.ToUpper(item.Op)
+		if op != "PUT" && op != "DELETE" {
+			return nil, fmt.Errorf("invalid batch operation")
+		}
+		if err := validateEncodedKey(item.Key); err != nil {
+			return nil, err
+		}
+		key, _ := base64.StdEncoding.DecodeString(item.Key)
+		if op == "PUT" {
+			if item.Value == nil {
+				return nil, fmt.Errorf("Missing value")
+			}
+			if err := validateEncodedValue(*item.Value); err != nil {
+				return nil, err
+			}
+			value, _ := base64.StdEncoding.DecodeString(*item.Value)
+			ops = append(ops, kvdb.Operation{Type: kvdb.Put, Key: key, Value: value})
 		} else {
-			fmt.Printf("ACK %s\n", id)
+			if item.Value != nil {
+				return nil, fmt.Errorf("DELETE must not contain value")
+			}
+			ops = append(ops, kvdb.Operation{Type: kvdb.Delete, Key: key})
 		}
 	}
-	if e := s.Err(); e != nil && e != io.EOF {
-		fmt.Fprintf(os.Stderr, "stdin: %v\n", e)
-	}
+	return ops, nil
 }
