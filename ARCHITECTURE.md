@@ -22,6 +22,21 @@ validate -> JSON operation records -> commit marker -> File.Sync()
 
 If append or synchronization fails, storage attempts to truncate and synchronize back to the transaction start. Uncertain outcomes poison storage; future writes return `ErrRecoveryRequired`.
 
+### Write failure and rollback
+
+`storage.commit` calculates the complete transaction size, records the original
+file size, appends operation records and the commit record, calls `File.Sync`,
+and advances the transaction ID only after synchronization succeeds. The DB
+map is changed only after the storage commit returns success.
+
+On a write failure, storage truncates to the original size, seeks back to the
+append position, and synchronizes the rollback. If rollback succeeds, the
+original write error is returned and the index is unchanged. If rollback or
+rollback synchronization fails, storage is poisoned and recovery is required.
+A synchronization failure has an uncertain outcome; later writes are rejected
+until reopen/recovery. JSONL reports `ERROR` with `outcome: UNKNOWN` and stops
+serving after that state is entered.
+
 ## KVCPv003 checkpoint
 
 Compaction creates a new file whose first frame is a binary checkpoint. All integer fields are little-endian:
@@ -61,6 +76,50 @@ If the first eight bytes are not `KVCPv003`, recovery uses the legacy JSON log p
 ## Compaction and replacement
 
 While holding the DB write lock, compaction captures the committed snapshot and current highest transaction ID. It writes and synchronizes `.compact-tmp`, closes it, reopens it, and independently validates the checkpoint. Only then does replacement proceed. Windows uses `ReplaceFileW` with `.compact-old`; other platforms use the portable rename fallback. The new file is reopened before backup cleanup. Directory synchronization is attempted where supported; Windows directory fsync is not provided here, so directory-entry persistence remains filesystem/OS dependent.
+
+## Verified hardening experiments
+
+### Real OS-level ENOSPC
+
+Under Ubuntu in WSL 2, the Linux executable was run with the database at
+`/mnt/kvdb-enospc/test.kv` on an isolated 128 MB ext4 loopback filesystem. The
+test acknowledged `acknowledged=original`, stored a 1 MB `oversized` value,
+filled the filesystem until approximately 684 KB remained, and submitted a
+three-operation batch for `batch-a`, `batch-b`, and `batch-c`. Linux returned
+`write /mnt/kvdb-enospc/test.kv: no space left on device`.
+
+After reopening, `acknowledged` and `oversized` retained their values; all
+three batch keys were `NOT_FOUND`; integrity check returned `OK`; and a
+subsequent write succeeded after the filler file was removed. This verifies the
+tested write-error rollback path, not every disk or rollback failure mode.
+
+### Race detection
+
+Under Ubuntu WSL 2, `CGO_ENABLED=1 go test -race ./...` completed successfully:
+
+| Package | Result |
+|---|---|
+| `killitandproveit/src/cmd/kvdb` | passed, 16.273s |
+| `killitandproveit/src/kvdb` | passed, 11.013s |
+| `killitandproveit/tests` | passed, 1.089s |
+| `src/cmd/recoverybench` | no test files |
+| `src/cmd/recoveryprofile` | no test files |
+
+No races were reported in the exercised paths; this is not proof that every
+possible execution path is race-free.
+
+### Recovery optimization
+
+Profiling found that normal checkpoint recovery reconstructed the million-key
+index twice: once in `validStorageCandidate` and again during recovery. When
+there are no replacement artifacts, normal open now performs one definitive
+validation pass. Backup and temporary candidates, or a missing authoritative
+path, still receive independent validation.
+
+On the same 1,000,000-key checkpointed database, five runs measured 1,854 ms,
+1,955 ms, 1,876 ms, 1,874 ms, and 1,931 ms; mean 1,898 ms. Every run recovered
+1,000,000 keys with the same logical checksum. The mean recovery time was 1.898 seconds, meeting the under-two-second average target. Individual runs ranged from 1.854 to 1.955 seconds. Allocation profiling decreased
+from approximately 1.49 GB to 937 MB (about 37.1%).
 
 ## Limits and concurrency
 

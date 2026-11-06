@@ -181,7 +181,7 @@ func serve(a []string) {
 	defer out.Flush()
 	fmt.Fprintln(os.Stderr, "READY")
 	s := bufio.NewScanner(os.Stdin)
-	s.Buffer(make([]byte, 64*1024), 4<<20)
+	s.Buffer(make([]byte, 64*1024), 16<<20)
 	for s.Scan() {
 		var req serveRequest
 		if err := json.Unmarshal(s.Bytes(), &req); err != nil {
