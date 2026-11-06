@@ -188,8 +188,6 @@ func serve(a []string) {
 			writeServeResponse(out, serveResponse{Status: "ERROR", Error: "Invalid JSON"})
 			continue
 		}
-		var fields map[string]json.RawMessage
-		_ = json.Unmarshal(s.Bytes(), &fields)
 		if err := validateID(req.ID); err != nil {
 			writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: err.Error()})
 			continue
@@ -223,20 +221,21 @@ func serve(a []string) {
 						return
 					}
 				} else {
-					writeServeResponse(out, serveResponse{ID: req.ID, Status: "VALUE", Value: base64.StdEncoding.EncodeToString(value)})
+					encodedValue := base64.StdEncoding.EncodeToString(value)
+					writeServeResponse(out, serveResponse{ID: req.ID, Status: "VALUE", Value: &encodedValue})
 				}
 				continue
 			}
 			if op == "PUT" {
-				if _, ok := fields["value"]; !ok {
+				if req.Value == nil {
 					writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: "Missing value"})
 					continue
 				}
-				if err := validateEncodedValue(req.Value); err != nil {
+				if err := validateEncodedValue(*req.Value); err != nil {
 					writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: err.Error()})
 					continue
 				}
-				value, _ := base64.StdEncoding.DecodeString(req.Value)
+				value, _ := base64.StdEncoding.DecodeString(*req.Value)
 				if err := db.Put(key, value); err != nil {
 					if !writeServeError(out, req.ID, err, db.RecoveryRequired()) {
 						return
@@ -286,7 +285,7 @@ type serveRequest struct {
 	ID         json.RawMessage       `json:"id"`
 	Op         string                `json:"op"`
 	Key        string                `json:"key"`
-	Value      string                `json:"value"`
+	Value      *string               `json:"value"`
 	Operations []serveBatchOperation `json:"operations"`
 }
 type serveBatchOperation struct {
@@ -301,7 +300,7 @@ type serveEntry struct {
 type serveResponse struct {
 	ID      json.RawMessage `json:"id,omitempty"`
 	Status  string          `json:"status"`
-	Value   string          `json:"value,omitempty"`
+	Value   *string         `json:"value,omitempty"`
 	Error   string          `json:"error,omitempty"`
 	Outcome string          `json:"outcome,omitempty"`
 	Entries []serveEntry    `json:"entries"`
@@ -359,9 +358,6 @@ func validateEncodedKey(s string) error {
 	return nil
 }
 func validateEncodedValue(s string) error {
-	if s == "" {
-		return fmt.Errorf("Missing value")
-	}
 	b, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
 		return fmt.Errorf("Invalid Base64 value")
