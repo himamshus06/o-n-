@@ -1,11 +1,11 @@
 package kvdb
 
 import (
-	"bufio"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"io"
 	"os"
 	"path/filepath"
@@ -16,6 +16,10 @@ import (
 var ErrNotFound = errors.New("key not found")
 var ErrClosed = errors.New("database is closed")
 var ErrMaxBytes = errors.New("database size limit exceeded")
+
+const maxRecordSize = 64 << 20
+
+var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 
 type OperationType uint8
 
@@ -28,6 +32,7 @@ type Operation struct {
 	Type       OperationType
 	Key, Value []byte
 }
+
 type RecordLocation struct {
 	Offset int64
 	Length uint32
@@ -38,16 +43,25 @@ type diskRecord struct {
 	Type       OperationType
 	Key, Value []byte
 	Commit     bool
+	Checksum   *uint32 `json:",omitempty"`
+}
+
+type storageFile interface {
+	io.Reader
+	io.Writer
+	io.Seeker
+	Stat() (os.FileInfo, error)
+	Truncate(size int64) error
+	Sync() error
+	Close() error
 }
 
 type storage struct {
 	mu       sync.Mutex
-	f        *os.File
+	f        storageFile
 	maxBytes int64
 	nextTx   uint64
-	path     string
-	lastCompaction time.Time
-	bytesReclaimed int64
+	poisoned bool
 }
 
 func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, error) {
@@ -68,7 +82,7 @@ func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, 
 	_ = os.Remove(path + ".compact-tmp")
 	committed := map[string]diskRecord{}
 	if err := s.recover(committed); err != nil {
-		f.Close()
+		_ = f.Close()
 		return nil, nil, err
 	}
 	_ = os.Remove(backup)
@@ -77,31 +91,60 @@ func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, 
 }
 
 func (s *storage) recover(index map[string]diskRecord) error {
+	return s.scan(index, true)
+}
+
+// scan validates and replays the file. Repair is enabled only for a final
+// frame whose length prefix or body is physically incomplete.
+func (s *storage) scan(index map[string]diskRecord, repair bool) error {
 	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
+	st, err := s.f.Stat()
+	if err != nil {
+		return err
+	}
+	size := st.Size()
 	pending := map[uint64][]diskRecord{}
 	var pos int64
-	r := bufio.NewReader(s.f)
-	for {
-		var n uint32
-		if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
-			if err == io.EOF {
-				break
-			}
-			return err
+	for pos < size {
+		start := pos
+		remaining := size - pos
+		if remaining < 4 {
+			return s.incompleteTail(start, repair, io.ErrUnexpectedEOF)
 		}
-		if n == 0 || n > 64<<20 {
-			return fmt.Errorf("invalid record length %d at %d", n, pos)
+		var prefix [4]byte
+		if _, err := io.ReadFull(s.f, prefix[:]); err != nil {
+			return fmt.Errorf("read record length at %d: %w", pos, err)
+		}
+		n := binary.LittleEndian.Uint32(prefix[:])
+		pos += 4
+		if n == 0 || n > maxRecordSize {
+			return fmt.Errorf("invalid record length %d at %d", n, start)
+		}
+		if int64(n) > size-pos {
+			return s.incompleteTail(start, repair, io.ErrUnexpectedEOF)
 		}
 		b := make([]byte, n)
-		if _, err := io.ReadFull(r, b); err != nil {
-			return err
+		if _, err := io.ReadFull(s.f, b); err != nil {
+			return fmt.Errorf("read record body at %d: %w", start, err)
 		}
-		pos += int64(4 + n)
+		pos += int64(n)
 		var rec diskRecord
 		if err := json.Unmarshal(b, &rec); err != nil {
-			return err
+			return fmt.Errorf("decode record at %d: %w", start, err)
+		}
+		if err := validateRecord(rec); err != nil {
+			return fmt.Errorf("invalid record at %d: %w", start, err)
+		}
+		if rec.Checksum != nil {
+			want, err := recordChecksum(rec)
+			if err != nil {
+				return fmt.Errorf("checksum record at %d: %w", start, err)
+			}
+			if *rec.Checksum != want {
+				return fmt.Errorf("checksum mismatch at %d", start)
+			}
 		}
 		if rec.TxID > s.nextTx {
 			s.nextTx = rec.TxID
@@ -115,26 +158,101 @@ func (s *storage) recover(index map[string]diskRecord) error {
 			pending[rec.TxID] = append(pending[rec.TxID], rec)
 		}
 	}
+	_, err = s.f.Seek(0, io.SeekEnd)
+	return err
+}
+
+func (s *storage) incompleteTail(offset int64, repair bool, cause error) error {
+	if !repair {
+		return fmt.Errorf("incomplete trailing record at %d: %w", offset, cause)
+	}
+	if err := s.f.Truncate(offset); err != nil {
+		s.poisoned = true
+		return fmt.Errorf("truncate incomplete trailing record at %d: %w", offset, err)
+	}
+	if _, err := s.f.Seek(offset, io.SeekStart); err != nil {
+		s.poisoned = true
+		return fmt.Errorf("seek after tail repair: %w", err)
+	}
+	if err := s.f.Sync(); err != nil {
+		s.poisoned = true
+		return fmt.Errorf("sync tail repair: %w", err)
+	}
 	_, err := s.f.Seek(0, io.SeekEnd)
 	return err
 }
 
-func (s *storage) appendLocked(rec diskRecord) error {
+func validateRecord(rec diskRecord) error {
+	if rec.TxID == 0 {
+		return errors.New("transaction ID must be positive")
+	}
+	if rec.Commit {
+		if rec.Type != 0 || len(rec.Key) != 0 || len(rec.Value) != 0 {
+			return errors.New("commit record contains operation fields")
+		}
+		return nil
+	}
+	if rec.Type != Put && rec.Type != Delete {
+		return fmt.Errorf("unknown operation type %d", rec.Type)
+	}
+	if len(rec.Key) > 1024 {
+		return errors.New("key exceeds 1024 bytes")
+	}
+	if rec.Type == Put && len(rec.Value) > 1<<20 {
+		return errors.New("value exceeds 1 MB")
+	}
+	if rec.Type == Delete && len(rec.Value) != 0 {
+		return errors.New("delete record contains a value")
+	}
+	return nil
+}
+
+func recordChecksum(rec diskRecord) (uint32, error) {
+	rec.Checksum = nil
 	b, err := json.Marshal(rec)
 	if err != nil {
-		return err
+		return 0, err
 	}
-	n := uint32(len(b))
-	if s.maxBytes > 0 {
-		st, e := s.f.Stat()
-		if e != nil { return e }
-		if st.Size()+int64(4+n) > s.maxBytes {
-			return ErrMaxBytes
+	return crc32.Checksum(b, castagnoliTable), nil
+}
+
+func marshalRecord(rec diskRecord) ([]byte, error) {
+	if err := validateRecord(rec); err != nil {
+		return nil, err
+	}
+	checksum, err := recordChecksum(rec)
+	if err != nil {
+		return nil, err
+	}
+	rec.Checksum = &checksum
+	b, err := json.Marshal(rec)
+	if err != nil {
+		return nil, err
+	}
+	if len(b) == 0 || len(b) > maxRecordSize {
+		return nil, fmt.Errorf("record size %d is outside supported range", len(b))
+	}
+	frame := make([]byte, 4+len(b))
+	binary.LittleEndian.PutUint32(frame[:4], uint32(len(b)))
+	copy(frame[4:], b)
+	return frame, nil
+}
+
+func writeFull(w io.Writer, p []byte) error {
+	for len(p) > 0 {
+		n, err := w.Write(p)
+		if n < 0 || n > len(p) {
+			return errors.New("invalid write count")
+		}
+		p = p[n:]
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
 		}
 	}
-	frame := make([]byte, 4+len(b)); binary.LittleEndian.PutUint32(frame, n); copy(frame[4:], b)
-	_, err = writeFull(s.f, frame)
-	return err
+	return nil
 }
 
 func writeFull(w io.Writer, b []byte) (int, error) {
@@ -146,71 +264,82 @@ func writeFull(w io.Writer, b []byte) (int, error) {
 func (s *storage) commit(ops []Operation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	start, err := s.f.Seek(0, io.SeekEnd); if err != nil { return err }
-	s.nextTx++
-	tx := s.nextTx
+	if s.f == nil {
+		return ErrClosed
+	}
+	if s.poisoned {
+		return errors.New("storage is unusable after an earlier I/O failure")
+	}
+	if s.nextTx == ^uint64(0) {
+		return errors.New("transaction ID space exhausted")
+	}
+	tx := s.nextTx + 1
+	var transactionSize int64
 	for _, op := range ops {
-		if err := s.appendLocked(diskRecord{TxID: tx, Type: op.Type, Key: append([]byte(nil), op.Key...), Value: append([]byte(nil), op.Value...)}); err != nil {
-			return s.rollbackLocked(start, err)
+		rec := diskRecord{TxID: tx, Type: op.Type, Key: append([]byte(nil), op.Key...), Value: append([]byte(nil), op.Value...)}
+		frame, err := marshalRecord(rec)
+		if err != nil {
+			return err
 		}
+		transactionSize += int64(len(frame))
 	}
-	if err := s.appendLocked(diskRecord{TxID: tx, Commit: true}); err != nil {
-		return s.rollbackLocked(start, err)
+	commitFrame, err := marshalRecord(diskRecord{TxID: tx, Commit: true})
+	if err != nil {
+		return err
 	}
-	if err := s.f.Sync(); err != nil { return s.rollbackLocked(start, err) }
+	transactionSize += int64(len(commitFrame))
+
+	st, err := s.f.Stat()
+	if err != nil {
+		return err
+	}
+	start := st.Size()
+	if s.maxBytes > 0 && transactionSize > s.maxBytes-start {
+		return fmt.Errorf("database size limit exceeded")
+	}
+	if _, err := s.f.Seek(start, io.SeekStart); err != nil {
+		return err
+	}
+	var wrote bool
+	for _, op := range ops {
+		rec := diskRecord{TxID: tx, Type: op.Type, Key: append([]byte(nil), op.Key...), Value: append([]byte(nil), op.Value...)}
+		frame, err := marshalRecord(rec)
+		if err != nil {
+			if wrote {
+				return s.rollbackAfterFailure(start, err, false)
+			}
+			return err
+		}
+		if err := writeFull(s.f, frame); err != nil {
+			return s.rollbackAfterFailure(start, err, false)
+		}
+		wrote = true
+	}
+	if err := writeFull(s.f, commitFrame); err != nil {
+		return s.rollbackAfterFailure(start, err, false)
+	}
+	if err := s.f.Sync(); err != nil {
+		return s.rollbackAfterFailure(start, err, true)
+	}
+	s.nextTx = tx
 	return nil
 }
 
-func (s *storage) rollbackLocked(start int64, cause error) error {
-	if err := s.f.Truncate(start); err != nil { return fmt.Errorf("%w (rollback failed: %v)", cause, err) }
-	if _, err := s.f.Seek(0, io.SeekEnd); err != nil { return fmt.Errorf("%w (seek after rollback: %v)", cause, err) }
-	if err := s.f.Sync(); err != nil { return fmt.Errorf("%w (sync after rollback: %v)", cause, err) }
+func (s *storage) rollbackAfterFailure(start int64, cause error, poison bool) error {
+	rollbackErr := s.f.Truncate(start)
+	if rollbackErr == nil {
+		_, rollbackErr = s.f.Seek(start, io.SeekStart)
+	}
+	if rollbackErr == nil {
+		rollbackErr = s.f.Sync()
+	}
+	if poison || rollbackErr != nil {
+		s.poisoned = true
+	}
+	if rollbackErr != nil {
+		return fmt.Errorf("transaction failed: %v; rollback failed: %w", cause, rollbackErr)
+	}
 	return cause
-}
-
-// compactLocked installs a complete replacement log while the caller holds
-// DB.mu exclusively. storage.mu excludes other file operations.
-func (s *storage) compactLocked(values map[string][]byte) error {
-	s.mu.Lock(); defer s.mu.Unlock()
-	tmp, backup := s.path+".compact-tmp", s.path+".compact-old"
-	_ = os.Remove(tmp)
-	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600); if err != nil { return err }
-	ok := false
-	defer func(){ f.Close(); if !ok { _ = os.Remove(tmp) } }()
-	var size int64; var tx uint64 = 1
-	for k, v := range values {
-		for _, rec := range []diskRecord{{TxID: tx, Type: Put, Key: []byte(k), Value: v}, {TxID: tx, Commit: true}} {
-			b, e := json.Marshal(rec); if e != nil { return e }; frame := make([]byte, 4+len(b)); binary.LittleEndian.PutUint32(frame, uint32(len(b))); copy(frame[4:], b)
-			if s.maxBytes > 0 && size+int64(len(frame)) > s.maxBytes { return ErrMaxBytes }
-			if _, e = writeFull(f, frame); e != nil { return e }; size += int64(len(frame))
-		}
-		tx++
-	}
-	if err = f.Sync(); err != nil { return err }
-	if _, _, err = openStorageCheck(f); err != nil { return fmt.Errorf("validate compacted file: %w", err) }
-	if err = f.Close(); err != nil { return err }
-	// The backup protocol works on Windows (Rename cannot replace an existing
-	// file) and POSIX. Open recovers the backup if a crash leaves no base file.
-	_ = os.Remove(backup)
-	if err = os.Rename(s.path, backup); err != nil { return err }
-	if err = os.Rename(tmp, s.path); err != nil { _ = os.Rename(backup, s.path); return err }
-	newFile, err := os.OpenFile(s.path, os.O_RDWR, 0600); if err != nil { return err }
-	old := s.f; s.f = newFile
-	oldInfo, _ := old.Stat(); oldSize := int64(0); if oldInfo != nil { oldSize = oldInfo.Size() }
-	s.nextTx = tx-1
-	s.lastCompaction = time.Now(); s.bytesReclaimed = oldSize-size
-	if err = syncDir(filepath.Dir(s.path)); err != nil { _ = old.Close(); return err }
-	if err = old.Close(); err != nil { return err }
-	_ = os.Remove(backup)
-	_ = syncDir(filepath.Dir(s.path))
-	ok = true
-	return nil
-}
-
-func syncDir(dir string) error {
-	if os.PathSeparator == '\\' { return nil }
-	f, err := os.Open(dir); if err != nil { return err }; defer f.Close()
-	if err = f.Sync(); err != nil { return err }; return nil
 }
 
 func (s *storage) close() error {
@@ -219,50 +348,36 @@ func (s *storage) close() error {
 	if s.f == nil {
 		return nil
 	}
-	err := s.f.Sync()
-	e := s.f.Close()
-	s.f = nil
-	if err != nil {
-		return err
+	var syncErr error
+	if !s.poisoned {
+		syncErr = s.f.Sync()
+		if syncErr != nil {
+			s.poisoned = true
+		}
 	}
-	return e
+	closeErr := s.f.Close()
+	s.f = nil
+	if syncErr != nil {
+		return syncErr
+	}
+	return closeErr
 }
+
 func (s *storage) check() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	_, err := s.f.Seek(0, io.SeekStart)
-	if err != nil {
+	if s.f == nil {
+		return ErrClosed
+	}
+	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	_, _, err = openStorageCheck(s.f)
-	return err
-}
-func openStorageCheck(f *os.File) (int64, int64, error) {
-	var pos, records int64
-	r := bufio.NewReader(f)
-	for {
-		var n uint32
-		err := binary.Read(r, binary.LittleEndian, &n)
-		if err == io.EOF {
-			break
+	scanErr := s.scan(map[string]diskRecord{}, false)
+	if _, err := s.f.Seek(0, io.SeekEnd); err != nil {
+		if scanErr != nil {
+			return fmt.Errorf("%v; restore file position: %w", scanErr, err)
 		}
-		if err != nil {
-			return pos, records, err
-		}
-		if n == 0 || n > 64<<20 {
-			return pos, records, fmt.Errorf("invalid record length at %d", pos)
-		}
-		b := make([]byte, n)
-		if _, err = io.ReadFull(r, b); err != nil {
-			return pos, records, err
-		}
-		var rec diskRecord
-		if err = json.Unmarshal(b, &rec); err != nil {
-			return pos, records, err
-		}
-		pos += int64(n) + 4
-		records++
+		return err
 	}
-	_, err := f.Seek(0, io.SeekEnd)
-	return pos, records, err
+	return scanErr
 }
