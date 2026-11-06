@@ -1,6 +1,7 @@
 
 import tempfile
 import unittest
+import os
 from pathlib import Path
 
 from adapter import AdapterConfig
@@ -16,17 +17,34 @@ from protocol import (
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-GO_BINARY = (PROJECT_ROOT / "kvdb").resolve()
+
+
+def go_executable() -> Path:
+    configured = os.environ.get("KVDB_EXECUTABLE")
+    candidates = [Path(configured)] if configured else []
+    if not configured:
+        names = ("kvdb.exe", "kvdb") if os.name == "nt" else ("kvdb", "kvdb.exe")
+        candidates.extend(PROJECT_ROOT / name for name in names)
+
+    for candidate in candidates:
+        resolved = candidate.expanduser().resolve()
+        if resolved.is_file():
+            return resolved
+
+    searched = ", ".join(str(path.expanduser().resolve()) for path in candidates)
+    raise FileNotFoundError(
+        "Go database executable not found. Set KVDB_EXECUTABLE or build one of: "
+        f"{searched}"
+    )
 
 
 class TestGoIntegration(unittest.TestCase):
 
     def setUp(self):
-        if not GO_BINARY.exists():
-            self.fail(
-                f"Go database executable not found: {GO_BINARY}\n"
-                "Build it first with: go build -o kvdb.exe ./src/cmd/kvdb"
-            )
+        try:
+            go_binary = go_executable()
+        except FileNotFoundError as exc:
+            self.fail(str(exc))
 
         self.temp_dir = tempfile.TemporaryDirectory()
         self.database_dir = Path(self.temp_dir.name)
@@ -34,7 +52,7 @@ class TestGoIntegration(unittest.TestCase):
         database_file = self.database_dir / "database.db"
 
         command = (
-            str(GO_BINARY),
+            str(go_binary),
             "serve",
             str(database_file),
         )

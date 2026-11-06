@@ -660,6 +660,73 @@ func TestCheckpointReplayBoundaryAndMalformedTail(t *testing.T) {
 	}
 }
 
+func TestCheckValidatesLegacyAndCheckpointFiles(t *testing.T) {
+	t.Run("legacy", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "legacy.kv")
+		legacy := append(
+			legacyFrame(t, diskRecord{TxID: 1, Type: Put, Key: []byte("key"), Value: []byte("value")}),
+			legacyFrame(t, diskRecord{TxID: 1, Commit: true})...,
+		)
+		if err := os.WriteFile(path, legacy, 0600); err != nil {
+			t.Fatal(err)
+		}
+		s, _, err := openStorage(path, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer s.close()
+		if err := s.check(); err != nil {
+			t.Fatalf("legacy check: %v", err)
+		}
+	})
+
+	t.Run("checkpoint and appended transactions", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "checkpoint.kv")
+		db, err := Open(path, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = db.Batch([]Operation{
+			{Type: Put, Key: []byte("live"), Value: []byte("before")},
+			{Type: Put, Key: []byte("deleted"), Value: []byte("remove")},
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if err = db.Delete([]byte("deleted")); err != nil {
+			t.Fatal(err)
+		}
+		if err = db.Compact(); err != nil {
+			t.Fatal(err)
+		}
+		if err = db.Batch([]Operation{{Type: Put, Key: []byte("after"), Value: []byte("append")}}); err != nil {
+			t.Fatal(err)
+		}
+		if err = db.Check(); err != nil {
+			t.Fatalf("checkpoint check: %v", err)
+		}
+		if err = db.Close(); err != nil {
+			t.Fatal(err)
+		}
+		reopened, err := Open(path, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer reopened.Close()
+		for key, want := range map[string]string{"live": "before", "after": "append"} {
+			got, err := reopened.Get([]byte(key))
+			if err != nil || string(got) != want {
+				t.Fatalf("%s: got %q, err %v", key, got, err)
+			}
+		}
+		if _, err := reopened.Get([]byte("deleted")); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("deleted key returned err %v", err)
+		}
+		if err = reopened.Check(); err != nil {
+			t.Fatalf("reopened checkpoint check: %v", err)
+		}
+	})
+}
+
 func TestCheckpointMillionEntryCount(t *testing.T) {
 	values := make(map[string][]byte, 1_000_000)
 	for i := 0; i < 1_000_000; i++ {

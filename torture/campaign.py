@@ -380,7 +380,7 @@ def _apply_to_copy(oracle: Oracle, request) -> Oracle:
     return candidate
 
 
-def _verify_permitted_states(adapter, oracles: list[Oracle]) -> None:
+def _verify_permitted_states(adapter, oracles: list[Oracle]) -> dict[bytes, bytes]:
     response = adapter.execute(DumpRequest(f"recovery-dump-{time.monotonic_ns()}"))
     if not hasattr(response, "entries"):
         raise AssertionError(f"recovery dump was not a DUMP response: {response!r}")
@@ -389,6 +389,8 @@ def _verify_permitted_states(adapter, oracles: list[Oracle]) -> None:
         raise AssertionError(
             "recovered state was not one of the permitted acknowledged/pre-post states"
         )
+    return actual
+    return actual
 
 
 def _run_random_crash(executable: Path, seed: int, iterations: int, report: CampaignReport) -> None:
@@ -453,7 +455,12 @@ def _run_random_crash(executable: Path, seed: int, iterations: int, report: Camp
                     report.crash_events.append(
                         {"kind": "random-process", "delay_ms": delay_ms, "request_id": request.request_id}
                     )
-                    _verify_permitted_states(adapter, permitted)
+                    recovered = _verify_permitted_states(adapter, permitted)
+                    # An unacknowledged write may have committed before the
+                    # process was killed.  Once the recovered snapshot has
+                    # been validated against the permitted states, use it as
+                    # the baseline for subsequent requests.
+                    oracle._data = recovered
             _check(executable, directory / "database.kv")
             _verify_permitted_states(adapter, [oracle])
             report.passed.append("random-process-crashes")

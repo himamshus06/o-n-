@@ -11,13 +11,25 @@ server protocol.
 
 -   Go toolchain compatible with the version declared in `go.mod`.
 -   Python 3 for the Python regression suite.
--   `pytest` to run that suite.
+-   `pytest` to run the pytest suite. Install the development dependency
+    with `python -m pip install -r requirements-dev.txt` when pytest is not
+    already available. The Go module has no third-party dependencies.
 
 Run the Go tests and build from the repository root:
 
 ``` sh
 go test ./...
 go build ./src/cmd/kvdb
+```
+
+On Windows, a clean-clone verification sequence is:
+
+``` powershell
+go build -o kvdb.exe ./src/cmd/kvdb
+go test ./...
+python -m pip install -r requirements-dev.txt
+$env:PYTHONPATH = "torture"
+python -m pytest torture/tests -v
 ```
 
 On Windows, build an executable with:
@@ -38,7 +50,7 @@ python -m pytest torture/tests -v
 Run a bounded campaign against an already-built executable:
 
 ``` powershell
-.\torture\quick-campaign.ps1 -Executable .\kvdb-baseline.exe -Seed 424242 -Operations 250
+.\torture\quick-campaign.ps1 -Executable .\kvdb.exe -Seed 424242 -Operations 250
 ```
 
 It uses fresh temporary databases and writes `artifacts/quick-campaign.json`
@@ -77,12 +89,12 @@ simulator-only faults and from physical disk exhaustion.
 
 ### WSL Ubuntu validation
 
-From WSL Ubuntu, with the repository available at `/mnt/d/Srinivas`:
+From WSL Ubuntu, with the repository available under `/mnt/d/<repository-directory>`:
 
 ```bash
 sudo apt update
 sudo apt install -y golang python3 python3-venv build-essential
-cd /mnt/d/Srinivas
+cd /mnt/d/<repository-directory>
 go version
 python3 --version
 go build -o kvdb ./src/cmd/kvdb
@@ -91,6 +103,8 @@ go build -tags kvdb_enospc -o kvdb-enospc ./src/cmd/kvdb
 python3 -m venv .venv-wsl
 . .venv-wsl/bin/activate
 python -m pip install --upgrade pip pytest
+go test ./...
+KVDB_EXECUTABLE=./kvdb PYTHONPATH=torture python -m pytest torture/tests -v
 PYTHONPATH=torture python -m unittest discover tests -v
 PYTHONPATH=torture python -m unittest discover torture/tests -v
 PYTHONPATH=torture python -m campaign \
