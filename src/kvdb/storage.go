@@ -518,6 +518,12 @@ func writeFull(w io.Writer, b []byte) error {
 	return nil
 }
 
+func writeFull(w io.Writer, b []byte) (int, error) {
+	total := 0
+	for total < len(b) { n, err := w.Write(b[total:]); total += n; if err != nil { return total, err }; if n == 0 { return total, io.ErrShortWrite } }
+	return total, nil
+}
+
 func (s *storage) commit(ops []Operation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
