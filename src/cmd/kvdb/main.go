@@ -1,12 +1,222 @@
 package main
 
-import("bufio";"encoding/base64";"fmt";"io";"os";"strconv";"strings";"time";"killitandproveit/src/kvdb")
-func main(){if len(os.Args)<2{usage();return};cmd:=os.Args[1];switch cmd{case "open": openCmd(os.Args[2:]);case "put": one(cmd,os.Args[2:]);case "get": one(cmd,os.Args[2:]);case "del": one(cmd,os.Args[2:]);case "batch": batch(os.Args[2:]);case "dump": dump(os.Args[2:]);case "check": check(os.Args[2:]);case "serve": serve(os.Args[2:]);default:usage()}}
-func usage(){fmt.Fprintln(os.Stderr,"usage: kvdb open|put|get|del|batch|dump|check|serve ...")}
-func openDB(path string)(*kvdb.DB,error){return kvdb.Open(path,0)}
-func openCmd(a []string){if len(a)<1{usage();return};max:=int64(0);for i:=1;i+1<len(a);i++{if a[i]=="--max-bytes"{max,_=strconv.ParseInt(a[i+1],10,64)}};t:=time.Now();db,e:=kvdb.Open(a[0],max);if e!=nil{fmt.Fprintln(os.Stderr,e);return};defer db.Close();fmt.Printf("keys %d\nrecovery_ms %d\n",len(db.Keys()),time.Since(t).Milliseconds())}
-func one(c string,a []string){if len(a)<2{usage();return};db,e:=openDB(a[0]);if e!=nil{fmt.Fprintln(os.Stderr,e);return};defer db.Close();var v []byte;if c=="put"{if len(a)<3{usage();return};e=db.Put([]byte(a[1]),[]byte(a[2]))}else if c=="del"{e=db.Delete([]byte(a[1]))}else{v,e=db.Get([]byte(a[1]));if e==kvdb.ErrNotFound{fmt.Println("NOTFOUND");return}};if e!=nil{fmt.Fprintln(os.Stderr,e);return};if c=="get"{fmt.Println(string(v))}else{fmt.Println("OK")}}
-func batch(a []string){if len(a)<2{usage();return};db,e:=openDB(a[0]);if e!=nil{fmt.Fprintln(os.Stderr,e);return};defer db.Close();f,e:=os.Open(a[1]);if e!=nil{fmt.Fprintln(os.Stderr,e);return};defer f.Close();var ops []kvdb.Operation;s:=bufio.NewScanner(f);for s.Scan(){p:=strings.SplitN(s.Text()," ",3);if len(p)<2{continue};if strings.EqualFold(p[0],"PUT")&&len(p)==3{ops=append(ops,kvdb.Operation{Type:kvdb.Put,Key:[]byte(p[1]),Value:[]byte(p[2])})}else if strings.EqualFold(p[0],"DELETE"){ops=append(ops,kvdb.Operation{Type:kvdb.Delete,Key:[]byte(p[1])})}};if e=s.Err();e==nil{e=db.Batch(ops)};if e!=nil{fmt.Fprintln(os.Stderr,e);return};fmt.Println("OK")}
-func dump(a []string){if len(a)<1{return};db,e:=openDB(a[0]);if e!=nil{fmt.Fprintln(os.Stderr,e);return};defer db.Close();m:=db.Keys();for _,k:=range kvdb.SortedKeys(m){fmt.Printf("%s %s\n",k,m[k])}}
-func check(a []string){if len(a)<1{return};db,e:=openDB(a[0]);if e==nil{e=db.Check();db.Close()};if e!=nil{fmt.Printf("ERROR %v\n",e)}else{fmt.Println("OK")}}
-func serve(a []string){if len(a)<1{return};db,e:=openDB(a[0]);if e!=nil{fmt.Fprintf(os.Stderr,"open: %v\n",e);return};defer db.Close();s:=bufio.NewScanner(os.Stdin);for s.Scan(){p:=strings.SplitN(s.Text()," ",4);if len(p)<3{continue};id,op:=p[0],strings.ToUpper(p[1]);var err error;switch op{case "PUT":if len(p)<4{err=fmt.Errorf("missing value")}else{v,_:=base64.StdEncoding.DecodeString(p[3]);k,_:=base64.StdEncoding.DecodeString(p[2]);err=db.Put(k,v)};case "GET":k,_:=base64.StdEncoding.DecodeString(p[2]);var v []byte;v,err=db.Get(k);if err==nil{fmt.Printf("VALUE %s %s\n",id,base64.StdEncoding.EncodeToString(v));continue};case "DELETE":k,_:=base64.StdEncoding.DecodeString(p[2]);err=db.Delete(k);default:err=fmt.Errorf("unknown operation")};if err==kvdb.ErrNotFound{fmt.Printf("NOTFOUND %s\n",id)}else if err!=nil{fmt.Printf("ERROR %s %s\n",id,strings.ReplaceAll(err.Error()," ","_"))}else{fmt.Printf("ACK %s\n",id)}};if e:=s.Err();e!=nil&&e!=io.EOF{fmt.Fprintf(os.Stderr,"stdin: %v\n",e)}}
+import (
+	"bufio"
+	"encoding/base64"
+	"fmt"
+	"io"
+	"killitandproveit/src/kvdb"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+)
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		return
+	}
+	cmd := os.Args[1]
+	switch cmd {
+	case "open":
+		openCmd(os.Args[2:])
+	case "put":
+		one(cmd, os.Args[2:])
+	case "get":
+		one(cmd, os.Args[2:])
+	case "del":
+		one(cmd, os.Args[2:])
+	case "batch":
+		batch(os.Args[2:])
+	case "dump":
+		dump(os.Args[2:])
+	case "check":
+		check(os.Args[2:])
+	case "serve":
+		serve(os.Args[2:])
+	default:
+		usage()
+	}
+}
+func usage()                               { fmt.Fprintln(os.Stderr, "usage: kvdb open|put|get|del|batch|dump|check|serve ...") }
+func openDB(path string) (*kvdb.DB, error) { return kvdb.Open(path, 0) }
+func openCmd(a []string) {
+	if len(a) < 1 {
+		usage()
+		return
+	}
+	max := int64(0)
+	for i := 1; i+1 < len(a); i++ {
+		if a[i] == "--max-bytes" {
+			max, _ = strconv.ParseInt(a[i+1], 10, 64)
+		}
+	}
+	t := time.Now()
+	db, e := kvdb.Open(a[0], max)
+	if e != nil {
+		fmt.Fprintln(os.Stderr, e)
+		return
+	}
+	defer db.Close()
+	fmt.Printf("keys %d\nrecovery_ms %d\n", len(db.Keys()), time.Since(t).Milliseconds())
+}
+func one(c string, a []string) {
+	if len(a) < 2 {
+		usage()
+		return
+	}
+	db, e := openDB(a[0])
+	if e != nil {
+		fmt.Fprintln(os.Stderr, e)
+		return
+	}
+	defer db.Close()
+	var v []byte
+	if c == "put" {
+		if len(a) < 3 {
+			usage()
+			return
+		}
+		e = db.Put([]byte(a[1]), []byte(a[2]))
+	} else if c == "del" {
+		e = db.Delete([]byte(a[1]))
+	} else {
+		v, e = db.Get([]byte(a[1]))
+		if e == kvdb.ErrNotFound {
+			fmt.Println("NOTFOUND")
+			return
+		}
+	}
+	if e != nil {
+		fmt.Fprintln(os.Stderr, e)
+		return
+	}
+	if c == "get" {
+		fmt.Println(string(v))
+	} else {
+		fmt.Println("OK")
+	}
+}
+func batch(a []string) {
+	if len(a) < 2 {
+		usage()
+		return
+	}
+	db, e := openDB(a[0])
+	if e != nil {
+		fmt.Fprintln(os.Stderr, e)
+		return
+	}
+	defer db.Close()
+	f, e := os.Open(a[1])
+	if e != nil {
+		fmt.Fprintln(os.Stderr, e)
+		return
+	}
+	defer f.Close()
+	var ops []kvdb.Operation
+	s := bufio.NewScanner(f)
+	for s.Scan() {
+		p := strings.SplitN(s.Text(), " ", 3)
+		if len(p) < 2 {
+			continue
+		}
+		if strings.EqualFold(p[0], "PUT") && len(p) == 3 {
+			ops = append(ops, kvdb.Operation{Type: kvdb.Put, Key: []byte(p[1]), Value: []byte(p[2])})
+		} else if strings.EqualFold(p[0], "DELETE") {
+			ops = append(ops, kvdb.Operation{Type: kvdb.Delete, Key: []byte(p[1])})
+		}
+	}
+	if e = s.Err(); e == nil {
+		e = db.Batch(ops)
+	}
+	if e != nil {
+		fmt.Fprintln(os.Stderr, e)
+		return
+	}
+	fmt.Println("OK")
+}
+func dump(a []string) {
+	if len(a) < 1 {
+		return
+	}
+	db, e := openDB(a[0])
+	if e != nil {
+		fmt.Fprintln(os.Stderr, e)
+		return
+	}
+	defer db.Close()
+	m := db.Keys()
+	for _, k := range kvdb.SortedKeys(m) {
+		fmt.Printf("%s %s\n", k, m[k])
+	}
+}
+func check(a []string) {
+	if len(a) < 1 {
+		return
+	}
+	db, e := openDB(a[0])
+	if e == nil {
+		e = db.Check()
+		db.Close()
+	}
+	if e != nil {
+		fmt.Printf("ERROR %v\n", e)
+	} else {
+		fmt.Println("OK")
+	}
+}
+func serve(a []string) {
+	if len(a) < 1 {
+		return
+	}
+	db, e := openDB(a[0])
+	if e != nil {
+		fmt.Fprintf(os.Stderr, "open: %v\n", e)
+		return
+	}
+	defer db.Close()
+	s := bufio.NewScanner(os.Stdin)
+	for s.Scan() {
+		p := strings.SplitN(s.Text(), " ", 4)
+		if len(p) < 3 {
+			continue
+		}
+		id, op := p[0], strings.ToUpper(p[1])
+		var err error
+		switch op {
+		case "PUT":
+			if len(p) < 4 {
+				err = fmt.Errorf("missing value")
+			} else {
+				v, _ := base64.StdEncoding.DecodeString(p[3])
+				k, _ := base64.StdEncoding.DecodeString(p[2])
+				err = db.Put(k, v)
+			}
+		case "GET":
+			k, _ := base64.StdEncoding.DecodeString(p[2])
+			var v []byte
+			v, err = db.Get(k)
+			if err == nil {
+				fmt.Printf("VALUE %s %s\n", id, base64.StdEncoding.EncodeToString(v))
+				continue
+			}
+		case "DELETE":
+			k, _ := base64.StdEncoding.DecodeString(p[2])
+			err = db.Delete(k)
+		default:
+			err = fmt.Errorf("unknown operation")
+		}
+		if err == kvdb.ErrNotFound {
+			fmt.Printf("NOTFOUND %s\n", id)
+		} else if err != nil {
+			fmt.Printf("ERROR %s %s\n", id, strings.ReplaceAll(err.Error(), " ", "_"))
+		} else {
+			fmt.Printf("ACK %s\n", id)
+		}
+	}
+	if e := s.Err(); e != nil && e != io.EOF {
+		fmt.Fprintf(os.Stderr, "stdin: %v\n", e)
+	}
+}
