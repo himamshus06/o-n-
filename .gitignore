@@ -1,0 +1,11 @@
+# Generated binaries and benchmark artifacts
+kvdb.exe
+recoverybench.exe
+recoveryprofile.exe
+*.kv
+*.cpu
+*.mem
+
+# Python test cache
+__pycache__/
+*.pyc
