@@ -1,0 +1,33 @@
+{
+  "started_utc": "2026-11-06T19:40:53.162056+00:00",
+  "seed": 424242,
+  "iterations": 500,
+  "modes": [
+    "injected-enospc"
+  ],
+  "passed": [
+    "injected-enospc",
+    "injected-enospc-batch-atomicity"
+  ],
+  "failed": [],
+  "not_tested": [
+    "recovery-crash mode",
+    "disk-full/ENOSPC mode",
+    "linearizability checking"
+  ],
+  "simulated_only": [],
+  "environment_blocked": [],
+  "crashes": 0,
+  "restarts": 0,
+  "acknowledged_writes": 2,
+  "failed_operations": 0,
+  "recovery_failures": 0,
+  "oracle_mismatches": 0,
+  "operations_attempted": 5,
+  "unknown_outcomes": 0,
+  "integrity_check_failures": 0,
+  "batch_atomicity_failures": 0,
+  "crash_events": [],
+  "finished_utc": "2026-11-06T19:40:53.401177+00:00",
+  "duration_seconds": 0.2391209602355957
+}

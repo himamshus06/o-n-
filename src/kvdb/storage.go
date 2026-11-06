@@ -204,6 +204,7 @@ func syncDir(path string) error {
 }
 
 func (s *storage) recover(index map[string]diskRecord) error {
+	faultInjectionPoint("recovery-started")
 	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
@@ -303,6 +304,7 @@ func (s *storage) scanFrom(start int64, index map[string]diskRecord, repair bool
 				index[string(op.Key)] = op
 			}
 			delete(pending, rec.TxID)
+			faultInjectionPoint("recovery-transaction-applied")
 		} else {
 			pending[rec.TxID] = append(pending[rec.TxID], rec)
 		}
@@ -571,6 +573,7 @@ func (s *storage) commit(ops []Operation) error {
 	if _, err := s.f.Seek(start, io.SeekStart); err != nil {
 		return err
 	}
+	faultInjectionPoint("before-operation-write")
 	var wrote bool
 	for _, op := range ops {
 		rec := diskRecord{TxID: tx, Type: op.Type, Key: append([]byte(nil), op.Key...), Value: append([]byte(nil), op.Value...)}
@@ -585,13 +588,18 @@ func (s *storage) commit(ops []Operation) error {
 			return s.rollbackAfterFailure(start, err, false)
 		}
 		wrote = true
+		faultInjectionPoint("after-operation-write")
 	}
+	faultInjectionPoint("before-commit-marker")
 	if err := writeFull(s.f, commitFrame); err != nil {
 		return s.rollbackAfterFailure(start, err, false)
 	}
+	faultInjectionPoint("after-commit-marker")
+	faultInjectionPoint("before-sync")
 	if err := s.f.Sync(); err != nil {
 		return s.rollbackAfterFailure(start, err, true)
 	}
+	faultInjectionPoint("after-sync")
 	s.nextTx = tx
 	return nil
 }
@@ -680,6 +688,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 	tmp := s.path + ".compact-tmp"
 	backup := s.path + ".compact-old"
 	compactionPoint("before-temp")
+	faultInjectionPoint("compaction-before-temp")
 	_ = os.Remove(tmp)
 	_ = os.Remove(backup)
 	tf, err := openStorageFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
@@ -717,6 +726,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 		return err
 	}
 	compactionPoint("after-temp-sync")
+	faultInjectionPoint("compaction-after-temp-sync")
 
 	if err = s.f.Close(); err != nil {
 		_ = os.Remove(tmp)
@@ -729,6 +739,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 		return err
 	}
 	compactionPoint("after-replacement")
+	faultInjectionPoint("compaction-after-replacement")
 	if err = syncDir(filepath.Dir(s.path)); err != nil {
 		// The new file is complete and authoritative; retain it, but report the
 		// directory durability limitation to the caller.
@@ -745,6 +756,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 		s.bytesReclaimed = 0
 	}
 	compactionPoint("before-backup-delete")
+	faultInjectionPoint("compaction-before-backup-delete")
 	_ = os.Remove(backup)
 	_ = syncDir(filepath.Dir(s.path))
 	return nil

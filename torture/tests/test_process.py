@@ -1,10 +1,12 @@
 import json
+import io
 from pathlib import Path
 import sys
 import tempfile
 import textwrap
 import time
 import unittest
+from unittest.mock import Mock
 
 from adapter import AdapterAmbiguousError, AdapterCommunicationError, AdapterRequestTimeoutError
 from process import ProcessConfig, SubprocessDatabaseAdapter
@@ -86,6 +88,27 @@ class ProcessAdapterTests(unittest.TestCase):
         finally:
             adapter.graceful_shutdown()
 
+    def test_process_config_environment_override_reaches_child(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        command = (sys.executable, "-u", "-c", SIMULATOR)
+        adapter = SubprocessDatabaseAdapter(
+            ProcessConfig(
+                command,
+                Path(temp_dir.name),
+                response_timeout_seconds=0.5,
+                env={"SIM_MODE": "durable"},
+            )
+        )
+        try:
+            adapter.start()
+            self.assertIsInstance(
+                adapter.send_request(PutRequest("env", b"k", b"v")),
+                Acknowledgement,
+            )
+        finally:
+            adapter.graceful_shutdown()
+            temp_dir.cleanup()
+
     def test_stderr_is_drained(self):
         adapter = self.start_adapter("stderr")
         try:
@@ -164,6 +187,39 @@ class ProcessAdapterTests(unittest.TestCase):
                 os.environ.pop("SIM_MODE", None)
             else:
                 os.environ["SIM_MODE"] = old_mode
+
+    def test_startup_exit_reports_exit_code_and_stderr(self):
+        temp_dir = tempfile.TemporaryDirectory()
+        command = (
+            sys.executable,
+            "-u",
+            "-c",
+            "import sys; print('injected recovery diagnostic', file=sys.stderr, flush=True); sys.exit(91)",
+        )
+        adapter = SubprocessDatabaseAdapter(
+            ProcessConfig(command, Path(temp_dir.name), startup_timeout_seconds=1.0)
+        )
+        try:
+            with self.assertRaises(AdapterCommunicationError) as context:
+                adapter.start()
+            message = str(context.exception)
+            self.assertIn("code 91", message)
+            self.assertIn("injected recovery diagnostic", message)
+        finally:
+            temp_dir.cleanup()
+
+    def test_stdout_exit_observes_unreported_exit_code(self):
+        adapter = self.make_adapter()
+        process = Mock()
+        process.stdout = io.StringIO("")
+        process.poll.return_value = None
+        process.wait.return_value = 91
+        adapter._process = process
+        adapter._ready_event.set()
+
+        adapter._read_stdout()
+
+        self.assertIn("code 91", str(adapter._terminal_error))
 
     def test_stderr_diagnostics_are_preserved_while_waiting(self):
         adapter = self.start_adapter("diagnostic")

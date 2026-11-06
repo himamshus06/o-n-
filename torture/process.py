@@ -54,6 +54,7 @@ class ProcessConfig:
     startup_timeout_seconds: float = 5.0
     stderr_buffer_lines: int = 200
     encoding: str = "utf-8"
+    env: Mapping[str, str] | None = None
 
     def __post_init__(self) -> None:
         if not self.command or any(
@@ -151,6 +152,9 @@ class SubprocessDatabaseAdapter(DatabaseAdapter):
             self._stderr_lines.clear()
 
         try:
+            child_environment = os.environ.copy()
+            if self.process_config.env is not None:
+                child_environment.update(self.process_config.env)
             process = subprocess.Popen(
                 list(self.process_config.command),
                 cwd=os.fspath(database_dir),
@@ -162,6 +166,7 @@ class SubprocessDatabaseAdapter(DatabaseAdapter):
                 errors="replace",
                 bufsize=1,
                 shell=False,
+                env=child_environment,
             )
 
         except OSError as exc:
@@ -461,10 +466,11 @@ class SubprocessDatabaseAdapter(DatabaseAdapter):
                 pass
 
             if not self._closing:
+                exit_code = self._observed_exit_code(process)
                 self._set_terminal_error(
                     AdapterAmbiguousError(
                         "database process exited unexpectedly "
-                        f"with code {process.returncode}"
+                        f"with code {exit_code}"
                     )
                 )
 
@@ -535,6 +541,23 @@ class SubprocessDatabaseAdapter(DatabaseAdapter):
     # READ STANDARD ERROR / READINESS
     # ---------------------------------------------------------
 
+    @staticmethod
+    def _observed_exit_code(process: subprocess.Popen[str]) -> int | None:
+        """Return the child exit code, reaping it briefly if needed.
+
+        A closed stderr pipe is a strong indication that the child has exited,
+        but ``Popen.returncode`` can still be ``None`` until ``poll``/``wait``
+        observes it. Startup diagnostics must not report that transient value
+        as the process's actual exit status.
+        """
+        code = process.poll()
+        if code is not None:
+            return code
+        try:
+            return process.wait(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            return process.poll()
+
     def _read_stderr(self) -> None:
 
         process = self._process
@@ -567,9 +590,14 @@ class SubprocessDatabaseAdapter(DatabaseAdapter):
 
             if not self._ready_event.is_set() and not self._closing:
 
+                exit_code = self._observed_exit_code(process)
+                with self._state_lock:
+                    diagnostics = "\n".join(self._stderr_lines)
+                detail = f"; stderr: {diagnostics}" if diagnostics else ""
+
                 self._startup_error = AdapterCommunicationError(
                     "database exited before READY "
-                    f"with code {process.returncode}"
+                    f"with code {exit_code}{detail}"
                 )
 
                 self._ready_event.set()

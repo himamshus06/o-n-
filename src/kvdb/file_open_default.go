@@ -1,4 +1,4 @@
-//go:build !kvdb_syncfail
+//go:build !kvdb_syncfail && !kvdb_enospc
 
 package kvdb
 

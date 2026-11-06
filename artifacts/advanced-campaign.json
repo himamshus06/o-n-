@@ -1,0 +1,33 @@
+{
+  "started_utc": "2026-11-06T18:37:46.5560318Z",
+  "seeds": [
+    7,
+    42,
+    424242,
+    9001
+  ],
+  "operations_per_seed": 1000,
+  "categories": {
+    "concurrency-library-stress": {
+      "passed": 1,
+      "failed": 0,
+      "executed": 1
+    },
+    "real-binary-seeded-workloads": {
+      "passed": 0,
+      "failed": 0,
+      "executed": 0
+    }
+  },
+  "failures": [],
+  "not_tested": [],
+  "simulated_only": [
+    "src/kvdb/storage_test.go memoryFile short-write, rollback, sync-failure tests",
+    "torture/simulator.py fault controls"
+  ],
+  "environment_blocked": [
+    "race detector unavailable: go: -race requires cgo; enable cgo by setting CGO_ENABLED=1",
+    "Program 'kvdb-fault.exe' failed to run: An error occurred trying to start process 'C:\\Users\\ANUJNA~1\\AppData\\Local\\Temp\\kvdb-advanced-00c40de46eb54cb6b9b9518d054c36e1\\kvdb-fault.exe' with working directory 'D:\\Srinivas'. An Application Control policy has blocked this file.At D:\\Srinivas\\torture\\advanced-campaign.ps1:36 char:80\r\n+ …  { $_ | ConvertTo-Json -Compress } | & $exe serve $db 2>$null); $code …\r\n+                                        ~~~~~~~~~~~~~~~~~~~~~~~~."
+  ],
+  "finished_utc": "2026-11-06T18:37:51.7669239Z"
+}

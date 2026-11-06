@@ -1,0 +1,7 @@
+{
+  "syncfail_executable": "D:\\Srinivas\\artifacts\\kvdb-syncfail.exe",
+  "process_exit": 0,
+  "response": "{\"id\":\"sync\",\"status\":\"ERROR\",\"error\":\"Commit outcome uncertain; database requires recovery\",\"outcome\":\"UNKNOWN\",\"entries\":null}",
+  "recovered_dump": "{\"id\":\"dump\",\"status\":\"DUMP\",\"entries\":[]}",
+  "classification": "actual tagged executable sync failure; not ENOSPC"
+}

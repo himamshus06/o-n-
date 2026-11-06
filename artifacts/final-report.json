@@ -1,0 +1,19 @@
+{
+  "date": "2026-11-06",
+  "passed": {
+    "seeded_real_binary_workloads": {"seeds": [7, 42, 424242, 9001], "operations_each": 1000},
+    "write_crash_boundaries": 6,
+    "batch_crash_boundaries": 4,
+    "compaction_crash_boundaries": 4,
+    "concurrency_api_test": 1,
+    "injected_sync_failure": 1
+  },
+  "failed": [],
+  "simulated_only": ["memory-file write/sync faults", "Python simulator faults"],
+  "environment_blocked": ["go test -race: gcc/cgo unavailable", "WSL: E_ACCESSDENIED"],
+  "not_tested": ["power loss", "hardware ENOSPC", "linearizability", "concurrent JSONL clients", "post-sync pre-ack kill"],
+  "claims": {
+    "supported": ["tested transaction recovery boundaries", "tested all-or-nothing batch recovery", "tested compaction interruption cases", "tested injected sync failure response semantics"],
+    "not_supported": ["power-loss safety", "race freedom", "linearizability", "hardware ENOSPC"]
+  }
+}

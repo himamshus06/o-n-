@@ -17,7 +17,8 @@ class WorkloadConfig:
     """Settings controlling how a workload is generated."""
 
     seed: int = 42
-    num_operations: int = 100
+    # The problem statement's default torture run is 500 top-level requests.
+    num_operations: int = 500
     keyspace_size: int = 20
     max_value_size: int = 100
     batch_probability: float = 0.15
