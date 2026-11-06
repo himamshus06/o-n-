@@ -117,7 +117,10 @@ func (db *DB) Compact() error {
 	if db.closed {
 		return ErrClosed
 	}
-	return db.storage.compactLocked(db.values)
+	db.storage.mu.Lock()
+	boundary := db.storage.nextTx
+	db.storage.mu.Unlock()
+	return db.storage.compactLocked(db.values, boundary)
 }
 
 // SpaceStats reports file and estimated live-data usage.

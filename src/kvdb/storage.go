@@ -1,6 +1,7 @@
 package kvdb
 
 import (
+	"bytes"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
@@ -20,6 +21,12 @@ var ErrMaxBytes = errors.New("database size limit exceeded")
 var ErrRecoveryRequired = errors.New("database requires recovery after an uncertain commit")
 
 const maxRecordSize = 64 << 20
+const checkpointMagic = "KVCPv003"
+const checkpointHeaderSize = 52
+const checkpointTrailerSize = 8
+const checkpointMarker uint32 = 0xC0DEC0DE
+const maxCheckpointSize = 512 << 20
+const maxCheckpointEntries = 10_000_000
 
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
 
@@ -143,7 +150,26 @@ func validStorageCandidate(path string) (valid, exists bool) {
 		return false, true
 	}
 	s := &storage{f: f, path: path}
-	err = s.scan(map[string]diskRecord{}, false)
+	var magic [8]byte
+	if _, err = io.ReadFull(f, magic[:]); err == nil && string(magic[:]) == checkpointMagic {
+		index := map[string]diskRecord{}
+		var tx uint64
+		var end int64
+		_, err = f.Seek(0, io.SeekStart)
+		if err != nil {
+			_ = f.Close()
+			return false, true
+		}
+		end, tx, err = s.loadCheckpoint(index)
+		if err == nil {
+			err = s.scanFrom(end, index, false, tx)
+		}
+	} else {
+		_, err = f.Seek(0, io.SeekStart)
+		if err == nil {
+			err = s.scan(map[string]diskRecord{}, false)
+		}
+	}
 	_ = f.Close()
 	return err == nil, true
 }
@@ -164,13 +190,41 @@ func syncDir(path string) error {
 }
 
 func (s *storage) recover(index map[string]diskRecord) error {
-	return s.scan(index, true)
+	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	var magic [8]byte
+	_, err := io.ReadFull(s.f, magic[:])
+	if err != nil {
+		if err == io.EOF || err == io.ErrUnexpectedEOF {
+			return s.scan(index, true)
+		}
+		return err
+	}
+	if string(magic[:]) != checkpointMagic {
+		if _, err = s.f.Seek(0, io.SeekStart); err != nil {
+			return err
+		}
+		return s.scan(index, true)
+	}
+	if _, err = s.f.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	checkpointEnd, txID, err := s.loadCheckpoint(index)
+	if err != nil {
+		return err
+	}
+	return s.scanFrom(checkpointEnd, index, true, txID)
 }
 
 // scan validates and replays the file. Repair is enabled only for a final
 // frame whose length prefix or body is physically incomplete.
 func (s *storage) scan(index map[string]diskRecord, repair bool) error {
-	if _, err := s.f.Seek(0, io.SeekStart); err != nil {
+	return s.scanFrom(0, index, repair, 0)
+}
+
+func (s *storage) scanFrom(start int64, index map[string]diskRecord, repair bool, checkpointTx uint64) error {
+	if _, err := s.f.Seek(start, io.SeekStart); err != nil {
 		return err
 	}
 	st, err := s.f.Stat()
@@ -179,7 +233,8 @@ func (s *storage) scan(index map[string]diskRecord, repair bool) error {
 	}
 	size := st.Size()
 	pending := map[uint64][]diskRecord{}
-	var pos int64
+	var pos = start
+	var lastTx uint64 = checkpointTx
 	for pos < size {
 		start := pos
 		remaining := size - pos
@@ -222,6 +277,13 @@ func (s *storage) scan(index map[string]diskRecord, repair bool) error {
 		if rec.TxID > s.nextTx {
 			s.nextTx = rec.TxID
 		}
+		if checkpointTx > 0 && rec.TxID <= checkpointTx {
+			return fmt.Errorf("transaction ID %d is not after checkpoint boundary %d", rec.TxID, checkpointTx)
+		}
+		if lastTx > 0 && rec.TxID < lastTx {
+			return fmt.Errorf("transaction ID regression from %d to %d", lastTx, rec.TxID)
+		}
+		lastTx = rec.TxID
 		if rec.Commit {
 			for _, op := range pending[rec.TxID] {
 				index[string(op.Key)] = op
@@ -233,6 +295,134 @@ func (s *storage) scan(index map[string]diskRecord, repair bool) error {
 	}
 	_, err = s.f.Seek(0, io.SeekEnd)
 	return err
+}
+
+func (s *storage) loadCheckpoint(index map[string]diskRecord) (int64, uint64, error) {
+	st, err := s.f.Stat()
+	if err != nil {
+		return 0, 0, err
+	}
+	if st.Size() < checkpointHeaderSize+checkpointTrailerSize {
+		return 0, 0, fmt.Errorf("checkpoint file is shorter than header")
+	}
+	header := make([]byte, checkpointHeaderSize)
+	if _, err = io.ReadFull(s.f, header); err != nil {
+		return 0, 0, err
+	}
+	if string(header[:8]) != checkpointMagic {
+		return 0, 0, fmt.Errorf("invalid checkpoint magic")
+	}
+	version := binary.LittleEndian.Uint16(header[8:10])
+	headerSize := binary.LittleEndian.Uint16(header[10:12])
+	if version != 3 || headerSize != checkpointHeaderSize {
+		return 0, 0, fmt.Errorf("unsupported checkpoint header")
+	}
+	generation := binary.LittleEndian.Uint64(header[12:20])
+	txID := binary.LittleEndian.Uint64(header[20:28])
+	count := binary.LittleEndian.Uint64(header[28:36])
+	payloadLen := binary.LittleEndian.Uint64(header[36:44])
+	if generation == 0 || count > maxCheckpointEntries || payloadLen > maxCheckpointSize {
+		return 0, 0, fmt.Errorf("checkpoint bounds invalid")
+	}
+	if uint64(st.Size()) < uint64(checkpointHeaderSize)+payloadLen+checkpointTrailerSize {
+		return 0, 0, fmt.Errorf("checkpoint payload exceeds file bounds")
+	}
+	if uint64(checkpointHeaderSize)+payloadLen+checkpointTrailerSize > uint64(maxCheckpointSize) {
+		return 0, 0, fmt.Errorf("checkpoint is too large")
+	}
+	wantHeader := binary.LittleEndian.Uint32(header[48:52])
+	gotHeader := crc32.Checksum(header[:48], castagnoliTable)
+	if wantHeader != gotHeader {
+		return 0, 0, fmt.Errorf("checkpoint header checksum mismatch")
+	}
+	payload := make([]byte, int(payloadLen))
+	if _, err = io.ReadFull(s.f, payload); err != nil {
+		return 0, 0, err
+	}
+	if binary.LittleEndian.Uint32(header[44:48]) != crc32.Checksum(payload, castagnoliTable) {
+		return 0, 0, fmt.Errorf("checkpoint payload checksum mismatch")
+	}
+	trailer := make([]byte, checkpointTrailerSize)
+	if _, err = io.ReadFull(s.f, trailer); err != nil {
+		return 0, 0, err
+	}
+	if binary.LittleEndian.Uint32(trailer[4:8]) != checkpointMarker {
+		return 0, 0, fmt.Errorf("checkpoint completion marker missing")
+	}
+	frame := make([]byte, 0, checkpointHeaderSize+len(payload))
+	frame = append(frame, header...)
+	frame = append(frame, payload...)
+	if binary.LittleEndian.Uint32(trailer[:4]) != crc32.Checksum(frame, castagnoliTable) {
+		return 0, 0, fmt.Errorf("checkpoint frame checksum mismatch")
+	}
+	pos := 0
+	var previous []byte
+	for i := uint64(0); i < count; i++ {
+		if len(payload)-pos < 8 {
+			return 0, 0, fmt.Errorf("checkpoint entry header truncated")
+		}
+		keyLen := int(binary.LittleEndian.Uint32(payload[pos : pos+4]))
+		valueLen := int(binary.LittleEndian.Uint32(payload[pos+4 : pos+8]))
+		pos += 8
+		if keyLen > 1024 || valueLen > 1<<20 || keyLen > len(payload)-pos || valueLen > len(payload)-pos-keyLen {
+			return 0, 0, fmt.Errorf("checkpoint entry bounds invalid")
+		}
+		key := payload[pos : pos+keyLen]
+		pos += keyLen
+		value := payload[pos : pos+valueLen]
+		pos += valueLen
+		if previous != nil && bytes.Compare(previous, key) >= 0 {
+			return 0, 0, fmt.Errorf("checkpoint entries are not strictly sorted")
+		}
+		copiedKey := string(append([]byte(nil), key...))
+		index[copiedKey] = diskRecord{TxID: txID, Type: Put, Key: []byte(copiedKey), Value: append([]byte(nil), value...)}
+		previous = key
+	}
+	if pos != len(payload) {
+		return 0, 0, fmt.Errorf("checkpoint payload has trailing bytes")
+	}
+	s.nextTx = txID
+	return int64(checkpointHeaderSize) + int64(payloadLen) + checkpointTrailerSize, txID, nil
+}
+
+func makeCheckpoint(values map[string][]byte, txID uint64, generation uint64) ([]byte, error) {
+	if generation == 0 {
+		generation = 1
+	}
+	keys := SortedKeys(values)
+	if len(keys) > maxCheckpointEntries {
+		return nil, fmt.Errorf("checkpoint entry count exceeds limit")
+	}
+	payload := make([]byte, 0)
+	for _, key := range keys {
+		value := values[key]
+		if len(key) > 1024 || len(value) > 1<<20 {
+			return nil, fmt.Errorf("checkpoint entry exceeds limit")
+		}
+		var lens [8]byte
+		binary.LittleEndian.PutUint32(lens[:4], uint32(len(key)))
+		binary.LittleEndian.PutUint32(lens[4:], uint32(len(value)))
+		payload = append(payload, lens[:]...)
+		payload = append(payload, key...)
+		payload = append(payload, value...)
+	}
+	if checkpointHeaderSize+len(payload)+checkpointTrailerSize > maxCheckpointSize {
+		return nil, fmt.Errorf("checkpoint is too large")
+	}
+	header := make([]byte, checkpointHeaderSize)
+	copy(header[:8], checkpointMagic)
+	binary.LittleEndian.PutUint16(header[8:10], 3)
+	binary.LittleEndian.PutUint16(header[10:12], checkpointHeaderSize)
+	binary.LittleEndian.PutUint64(header[12:20], generation)
+	binary.LittleEndian.PutUint64(header[20:28], txID)
+	binary.LittleEndian.PutUint64(header[28:36], uint64(len(keys)))
+	binary.LittleEndian.PutUint64(header[36:44], uint64(len(payload)))
+	binary.LittleEndian.PutUint32(header[44:48], crc32.Checksum(payload, castagnoliTable))
+	binary.LittleEndian.PutUint32(header[48:52], crc32.Checksum(header[:48], castagnoliTable))
+	frame := append(append(header, payload...), make([]byte, checkpointTrailerSize)...)
+	binary.LittleEndian.PutUint32(frame[len(frame)-8:len(frame)-4], crc32.Checksum(frame[:len(frame)-8], castagnoliTable))
+	binary.LittleEndian.PutUint32(frame[len(frame)-4:], checkpointMarker)
+	return frame, nil
 }
 
 func (s *storage) incompleteTail(offset int64, repair bool, cause error) error {
@@ -449,7 +639,7 @@ func (s *storage) check() error {
 	return scanErr
 }
 
-func (s *storage) compactLocked(values map[string][]byte) error {
+func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.f == nil {
@@ -464,22 +654,11 @@ func (s *storage) compactLocked(values map[string][]byte) error {
 		return err
 	}
 	oldSize := oldInfo.Size()
-	tx := s.nextTx + 1
-	var frames [][]byte
-	var total int64
-	for _, key := range SortedKeys(values) {
-		frame, e := marshalRecord(diskRecord{TxID: tx, Type: Put, Key: []byte(key), Value: append([]byte(nil), values[key]...)})
-		if e != nil {
-			return e
-		}
-		frames = append(frames, frame)
-		total += int64(len(frame))
-	}
-	commitFrame, err := marshalRecord(diskRecord{TxID: tx, Commit: true})
+	checkpoint, err := makeCheckpoint(values, checkpointTx, s.nextTx+1)
 	if err != nil {
 		return err
 	}
-	total += int64(len(commitFrame))
+	total := int64(len(checkpoint))
 	if s.maxBytes > 0 && total > s.maxBytes {
 		return ErrMaxBytes
 	}
@@ -493,14 +672,7 @@ func (s *storage) compactLocked(values map[string][]byte) error {
 	if err != nil {
 		return err
 	}
-	for _, frame := range frames {
-		if err = writeFull(tf, frame); err != nil {
-			tf.Close()
-			_ = os.Remove(tmp)
-			return err
-		}
-	}
-	if err = writeFull(tf, commitFrame); err != nil {
+	if err = writeFull(tf, checkpoint); err != nil {
 		tf.Close()
 		_ = os.Remove(tmp)
 		return err
@@ -510,11 +682,27 @@ func (s *storage) compactLocked(values map[string][]byte) error {
 		_ = os.Remove(tmp)
 		return err
 	}
-	compactionPoint("after-temp-sync")
 	if err = tf.Close(); err != nil {
 		_ = os.Remove(tmp)
 		return err
 	}
+	validationFile, err := os.OpenFile(tmp, os.O_RDWR, 0600)
+	if err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	validationStorage := &storage{f: validationFile, path: tmp}
+	validationIndex := map[string]diskRecord{}
+	if _, _, err = validationStorage.loadCheckpoint(validationIndex); err != nil {
+		_ = validationFile.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err = validationFile.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	compactionPoint("after-temp-sync")
 
 	if err = s.f.Close(); err != nil {
 		_ = os.Remove(tmp)
@@ -536,7 +724,7 @@ func (s *storage) compactLocked(values map[string][]byte) error {
 		return err
 	}
 	s.f = newFile
-	s.nextTx = tx
+	s.nextTx = checkpointTx
 	s.lastCompaction = time.Now()
 	s.bytesReclaimed = oldSize - total
 	if s.bytesReclaimed < 0 {
