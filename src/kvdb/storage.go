@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"time"
 )
@@ -16,10 +17,21 @@ import (
 var ErrNotFound = errors.New("key not found")
 var ErrClosed = errors.New("database is closed")
 var ErrMaxBytes = errors.New("database size limit exceeded")
+var ErrRecoveryRequired = errors.New("database requires recovery after an uncertain commit")
 
 const maxRecordSize = 64 << 20
 
 var castagnoliTable = crc32.MakeTable(crc32.Castagnoli)
+
+// compactionHook is intentionally nil in production. Tests use it to model a
+// process terminating at named filesystem boundaries.
+var compactionHook func(string)
+
+func compactionPoint(name string) {
+	if compactionHook != nil {
+		compactionHook(name)
+	}
+}
 
 type OperationType uint8
 
@@ -57,19 +69,48 @@ type storageFile interface {
 }
 
 type storage struct {
-	mu       sync.Mutex
-	f        storageFile
-	maxBytes int64
-	nextTx   uint64
-	poisoned bool
+	mu             sync.Mutex
+	f              storageFile
+	path           string
+	maxBytes       int64
+	nextTx         uint64
+	poisoned       bool
+	lastCompaction time.Time
+	bytesReclaimed int64
 }
 
 func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, error) {
 	backup := path + ".compact-old"
-	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
-		if _, backupErr := os.Stat(backup); backupErr == nil {
-			if err := os.Rename(backup, path); err != nil { return nil, nil, err }
+	tmp := path + ".compact-tmp"
+	pathValid, pathExists := validStorageCandidate(path)
+	backupValid, backupExists := validStorageCandidate(backup)
+	tmpValid, _ := validStorageCandidate(tmp)
+	if !pathExists || !pathValid {
+		if backupValid {
+			if pathExists {
+				_ = os.Remove(path)
+			}
+			if err := os.Rename(backup, path); err != nil {
+				return nil, nil, err
+			}
+			pathValid, pathExists = true, true
+		} else if !pathExists && tmpValid {
+			if err := os.Rename(tmp, path); err != nil {
+				return nil, nil, err
+			}
+			pathValid, pathExists = true, true
+		} else if pathExists {
+			// Keep an existing candidate selected when no validated backup is
+			// available so the normal recovery pass can report corruption or
+			// repair a physically incomplete tail.
+			pathValid = true
 		}
+	}
+	if !pathExists {
+		// No valid candidate exists; OpenFile below creates a new empty DB.
+		_ = backupExists
+	} else if !pathValid {
+		return nil, nil, fmt.Errorf("no valid authoritative database file")
 	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
@@ -79,7 +120,7 @@ func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, 
 	// A backup is retained until the replacement has been installed and the
 	// directory entry synchronized. If the base is missing after a crash, it
 	// is the only known-good copy.
-	_ = os.Remove(path + ".compact-tmp")
+	_ = os.Remove(tmp)
 	committed := map[string]diskRecord{}
 	if err := s.recover(committed); err != nil {
 		_ = f.Close()
@@ -88,6 +129,38 @@ func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, 
 	_ = os.Remove(backup)
 	_ = syncDir(filepath.Dir(path))
 	return s, committed, nil
+}
+
+// validStorageCandidate validates a candidate without selecting it. Complete
+// corruption is never repaired or silently accepted; only the normal recovery
+// pass may repair an incomplete final frame after a candidate is selected.
+func validStorageCandidate(path string) (valid, exists bool) {
+	if _, err := os.Stat(path); err != nil {
+		return false, false
+	}
+	f, err := os.OpenFile(path, os.O_RDWR, 0600)
+	if err != nil {
+		return false, true
+	}
+	s := &storage{f: f, path: path}
+	err = s.scan(map[string]diskRecord{}, false)
+	_ = f.Close()
+	return err == nil, true
+}
+
+// syncDir requests directory-entry durability on platforms that expose it.
+// Windows does not provide a portable directory fsync operation through the
+// standard library; atomic rename remains the replacement primitive there.
+func syncDir(path string) error {
+	if runtime.GOOS == "windows" {
+		return nil
+	}
+	d, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	return d.Sync()
 }
 
 func (s *storage) recover(index map[string]diskRecord) error {
@@ -238,13 +311,13 @@ func marshalRecord(rec diskRecord) ([]byte, error) {
 	return frame, nil
 }
 
-func writeFull(w io.Writer, p []byte) error {
-	for len(p) > 0 {
-		n, err := w.Write(p)
-		if n < 0 || n > len(p) {
+func writeFull(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		if n < 0 || n > len(b) {
 			return errors.New("invalid write count")
 		}
-		p = p[n:]
+		b = b[n:]
 		if err != nil {
 			return err
 		}
@@ -255,12 +328,6 @@ func writeFull(w io.Writer, p []byte) error {
 	return nil
 }
 
-func writeFull(w io.Writer, b []byte) (int, error) {
-	total := 0
-	for total < len(b) { n, err := w.Write(b[total:]); total += n; if err != nil { return total, err }; if n == 0 { return total, io.ErrShortWrite } }
-	return total, nil
-}
-
 func (s *storage) commit(ops []Operation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -268,7 +335,7 @@ func (s *storage) commit(ops []Operation) error {
 		return ErrClosed
 	}
 	if s.poisoned {
-		return errors.New("storage is unusable after an earlier I/O failure")
+		return ErrRecoveryRequired
 	}
 	if s.nextTx == ^uint64(0) {
 		return errors.New("transaction ID space exhausted")
@@ -380,4 +447,103 @@ func (s *storage) check() error {
 		return err
 	}
 	return scanErr
+}
+
+func (s *storage) compactLocked(values map[string][]byte) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.f == nil {
+		return ErrClosed
+	}
+	if s.poisoned {
+		return ErrRecoveryRequired
+	}
+
+	oldInfo, err := s.f.Stat()
+	if err != nil {
+		return err
+	}
+	oldSize := oldInfo.Size()
+	tx := s.nextTx + 1
+	var frames [][]byte
+	var total int64
+	for _, key := range SortedKeys(values) {
+		frame, e := marshalRecord(diskRecord{TxID: tx, Type: Put, Key: []byte(key), Value: append([]byte(nil), values[key]...)})
+		if e != nil {
+			return e
+		}
+		frames = append(frames, frame)
+		total += int64(len(frame))
+	}
+	commitFrame, err := marshalRecord(diskRecord{TxID: tx, Commit: true})
+	if err != nil {
+		return err
+	}
+	total += int64(len(commitFrame))
+	if s.maxBytes > 0 && total > s.maxBytes {
+		return ErrMaxBytes
+	}
+
+	tmp := s.path + ".compact-tmp"
+	backup := s.path + ".compact-old"
+	compactionPoint("before-temp")
+	_ = os.Remove(tmp)
+	_ = os.Remove(backup)
+	tf, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	if err != nil {
+		return err
+	}
+	for _, frame := range frames {
+		if err = writeFull(tf, frame); err != nil {
+			tf.Close()
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+	if err = writeFull(tf, commitFrame); err != nil {
+		tf.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err = tf.Sync(); err != nil {
+		tf.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	compactionPoint("after-temp-sync")
+	if err = tf.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+
+	if err = s.f.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	s.f = nil
+	if err = replaceAuthoritative(s.path, tmp, backup); err != nil {
+		s.f, _ = os.OpenFile(s.path, os.O_RDWR, 0600)
+		_ = os.Remove(tmp)
+		return err
+	}
+	compactionPoint("after-replacement")
+	if err = syncDir(filepath.Dir(s.path)); err != nil {
+		// The new file is complete and authoritative; retain it, but report the
+		// directory durability limitation to the caller.
+	}
+	newFile, err := os.OpenFile(s.path, os.O_RDWR, 0600)
+	if err != nil {
+		return err
+	}
+	s.f = newFile
+	s.nextTx = tx
+	s.lastCompaction = time.Now()
+	s.bytesReclaimed = oldSize - total
+	if s.bytesReclaimed < 0 {
+		s.bytesReclaimed = 0
+	}
+	compactionPoint("before-backup-delete")
+	_ = os.Remove(backup)
+	_ = syncDir(filepath.Dir(s.path))
+	return nil
 }

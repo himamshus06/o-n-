@@ -8,17 +8,18 @@ import (
 )
 
 type DB struct {
-	mu      sync.RWMutex
-	storage *storage
-	values  map[string][]byte
-	closed  bool
+	mu               sync.RWMutex
+	storage          *storage
+	values           map[string][]byte
+	closed           bool
+	recoveryRequired bool
 }
 
 type SpaceStats struct {
-	CurrentBytes int64
-	MaxBytes int64
-	LiveBytes int64
-	ObsoleteBytes int64
+	CurrentBytes   int64
+	MaxBytes       int64
+	LiveBytes      int64
+	ObsoleteBytes  int64
 	AvailableBytes int64
 	LastCompaction time.Time
 	BytesReclaimed int64
@@ -60,6 +61,9 @@ func (db *DB) Batch(ops []Operation) error {
 	if db.closed {
 		return ErrClosed
 	}
+	if db.recoveryRequired {
+		return ErrRecoveryRequired
+	}
 	for _, op := range ops {
 		if len(op.Key) > 1024 {
 			return &limitError{"key exceeds 1024 bytes"}
@@ -72,6 +76,9 @@ func (db *DB) Batch(ops []Operation) error {
 		}
 	}
 	if err := db.storage.commit(ops); err != nil {
+		if db.storage.poisoned {
+			db.recoveryRequired = true
+		}
 		return err
 	}
 	for _, op := range ops {
@@ -82,6 +89,15 @@ func (db *DB) Batch(ops []Operation) error {
 		}
 	}
 	return nil
+}
+
+// RecoveryRequired reports whether a failed storage operation left the commit
+// outcome uncertain. Reopening the database performs recovery and clears this
+// state.
+func (db *DB) RecoveryRequired() bool {
+	db.mu.RLock()
+	defer db.mu.RUnlock()
+	return db.recoveryRequired
 }
 func (db *DB) Keys() map[string][]byte {
 	db.mu.RLock()
@@ -98,7 +114,9 @@ func (db *DB) Keys() map[string][]byte {
 func (db *DB) Compact() error {
 	db.mu.Lock()
 	defer db.mu.Unlock()
-	if db.closed { return ErrClosed }
+	if db.closed {
+		return ErrClosed
+	}
 	return db.storage.compactLocked(db.values)
 }
 
@@ -106,18 +124,35 @@ func (db *DB) Compact() error {
 func (db *DB) SpaceStats() (SpaceStats, error) {
 	db.mu.RLock()
 	defer db.mu.RUnlock()
-	if db.closed { return SpaceStats{}, ErrClosed }
-	db.storage.mu.Lock(); defer db.storage.mu.Unlock()
-	st, err := db.storage.f.Stat(); if err != nil { return SpaceStats{}, err }
+	if db.closed {
+		return SpaceStats{}, ErrClosed
+	}
+	db.storage.mu.Lock()
+	defer db.storage.mu.Unlock()
+	st, err := db.storage.f.Stat()
+	if err != nil {
+		return SpaceStats{}, err
+	}
 	var live int64
 	for k, v := range db.values {
 		for _, rec := range []diskRecord{{TxID: 1, Type: Put, Key: []byte(k), Value: v}, {TxID: 1, Commit: true}} {
-			b, e := json.Marshal(rec); if e != nil { return SpaceStats{}, e }; live += int64(4+len(b))
+			b, e := json.Marshal(rec)
+			if e != nil {
+				return SpaceStats{}, e
+			}
+			live += int64(4 + len(b))
 		}
 	}
-	stats := SpaceStats{CurrentBytes: st.Size(), MaxBytes: db.storage.maxBytes, LiveBytes: live, ObsoleteBytes: st.Size()-live, LastCompaction: db.storage.lastCompaction, BytesReclaimed: db.storage.bytesReclaimed}
-	if stats.ObsoleteBytes < 0 { stats.ObsoleteBytes = 0 }
-	if stats.MaxBytes > 0 { stats.AvailableBytes = stats.MaxBytes-st.Size(); if stats.AvailableBytes < 0 { stats.AvailableBytes = 0 } }
+	stats := SpaceStats{CurrentBytes: st.Size(), MaxBytes: db.storage.maxBytes, LiveBytes: live, ObsoleteBytes: st.Size() - live, LastCompaction: db.storage.lastCompaction, BytesReclaimed: db.storage.bytesReclaimed}
+	if stats.ObsoleteBytes < 0 {
+		stats.ObsoleteBytes = 0
+	}
+	if stats.MaxBytes > 0 {
+		stats.AvailableBytes = stats.MaxBytes - st.Size()
+		if stats.AvailableBytes < 0 {
+			stats.AvailableBytes = 0
+		}
+	}
 	return stats, nil
 }
 func (db *DB) Check() error {
