@@ -8,11 +8,14 @@ import (
 	"hash/crc32"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
+	"time"
 )
 
 var ErrNotFound = errors.New("key not found")
 var ErrClosed = errors.New("database is closed")
+var ErrMaxBytes = errors.New("database size limit exceeded")
 
 const maxRecordSize = 64 << 20
 
@@ -62,16 +65,28 @@ type storage struct {
 }
 
 func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, error) {
+	backup := path + ".compact-old"
+	if _, statErr := os.Stat(path); errors.Is(statErr, os.ErrNotExist) {
+		if _, backupErr := os.Stat(backup); backupErr == nil {
+			if err := os.Rename(backup, path); err != nil { return nil, nil, err }
+		}
+	}
 	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return nil, nil, err
 	}
-	s := &storage{f: f, maxBytes: maxBytes}
+	s := &storage{f: f, maxBytes: maxBytes, path: path}
+	// A backup is retained until the replacement has been installed and the
+	// directory entry synchronized. If the base is missing after a crash, it
+	// is the only known-good copy.
+	_ = os.Remove(path + ".compact-tmp")
 	committed := map[string]diskRecord{}
 	if err := s.recover(committed); err != nil {
 		_ = f.Close()
 		return nil, nil, err
 	}
+	_ = os.Remove(backup)
+	_ = syncDir(filepath.Dir(path))
 	return s, committed, nil
 }
 
@@ -238,6 +253,12 @@ func writeFull(w io.Writer, p []byte) error {
 		}
 	}
 	return nil
+}
+
+func writeFull(w io.Writer, b []byte) (int, error) {
+	total := 0
+	for total < len(b) { n, err := w.Write(b[total:]); total += n; if err != nil { return total, err }; if n == 0 { return total, io.ErrShortWrite } }
+	return total, nil
 }
 
 func (s *storage) commit(ops []Operation) error {
