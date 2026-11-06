@@ -3,6 +3,7 @@ package tests
 import (
 	"errors"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"killitandproveit/src/kvdb"
@@ -58,26 +59,143 @@ func TestBatchLastOperationWins(t *testing.T) {
 func TestCompactPreservesLiveValuesAndReopens(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "db.kv")
 	db, err := kvdb.Open(p, 0)
-	if err != nil { t.Fatal(err) }
-	for i := 0; i < 10; i++ { if err = db.Put([]byte("keep"), []byte{byte('0'+i)}); err != nil { t.Fatal(err) } }
-	if err = db.Put([]byte("empty"), []byte{}); err != nil { t.Fatal(err) }
-	if err = db.Put([]byte("gone"), []byte("x")); err != nil { t.Fatal(err) }
-	if err = db.Delete([]byte("gone")); err != nil { t.Fatal(err) }
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 10; i++ {
+		if err = db.Put([]byte("keep"), []byte{byte('0' + i)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err = db.Put([]byte("empty"), []byte{}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Put([]byte("gone"), []byte("x")); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Delete([]byte("gone")); err != nil {
+		t.Fatal(err)
+	}
 	before := db.Keys()
-	if err = db.Compact(); err != nil { t.Fatal(err) }
-	if got := db.Keys(); len(got) != len(before) || string(got["keep"]) != string(before["keep"]) { t.Fatalf("values changed: %#v", got) }
-	stats, err := db.SpaceStats(); if err != nil { t.Fatal(err) }; if stats.CurrentBytes <= 0 || stats.BytesReclaimed <= 0 { t.Fatalf("unexpected stats: %+v", stats) }
-	if err = db.Close(); err != nil { t.Fatal(err) }
-	db, err = kvdb.Open(p, 0); if err != nil { t.Fatal(err) }; defer db.Close()
-	if got := db.Keys(); len(got) != len(before) || string(got["keep"]) != string(before["keep"]) { t.Fatalf("reopened values changed: %#v", got) }
+	if err = db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if got := db.Keys(); len(got) != len(before) || string(got["keep"]) != string(before["keep"]) {
+		t.Fatalf("values changed: %#v", got)
+	}
+	stats, err := db.SpaceStats()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.CurrentBytes <= 0 || stats.BytesReclaimed <= 0 {
+		t.Fatalf("unexpected stats: %+v", stats)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = kvdb.Open(p, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if got := db.Keys(); len(got) != len(before) || string(got["keep"]) != string(before["keep"]) {
+		t.Fatalf("reopened values changed: %#v", got)
+	}
 }
 
 func TestCompactRejectsIfLiveSetExceedsLimit(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "db.kv")
-	db, err := kvdb.Open(p, 0); if err != nil { t.Fatal(err) }
-	if err = db.Put([]byte("k"), []byte("large enough live record")); err != nil { t.Fatal(err) }
-	if err = db.Close(); err != nil { t.Fatal(err) }
-	db, err = kvdb.Open(p, 1); if err != nil { t.Fatal(err) }; defer db.Close()
-	if err = db.Compact(); !errors.Is(err, kvdb.ErrMaxBytes) { t.Fatalf("expected max size error, got %v", err) }
-	if v, e := db.Get([]byte("k")); e != nil || string(v) != "large enough live record" { t.Fatalf("old data unavailable after failed compaction: %q %v", v, e) }
+	db, err := kvdb.Open(p, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Put([]byte("k"), []byte("large enough live record")); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err = kvdb.Open(p, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Compact(); !errors.Is(err, kvdb.ErrMaxBytes) {
+		t.Fatalf("expected max size error, got %v", err)
+	}
+	if v, e := db.Get([]byte("k")); e != nil || string(v) != "large enough live record" {
+		t.Fatalf("old data unavailable after failed compaction: %q %v", v, e)
+	}
+}
+
+func TestRepeatedAndEmptyCompaction(t *testing.T) {
+	db, err := kvdb.Open(filepath.Join(t.TempDir(), "db.kv"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if len(db.Keys()) != 0 {
+		t.Fatalf("empty compaction created keys: %#v", db.Keys())
+	}
+	if err = db.Put([]byte("k"), []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Put([]byte("k"), []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	v, err := db.Get([]byte("k"))
+	if err != nil || string(v) != "v2" {
+		t.Fatalf("repeated compaction changed value: %q %v", v, err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestConcurrentReadersAndWritersWithCompaction(t *testing.T) {
+	db, err := kvdb.Open(filepath.Join(t.TempDir(), "db.kv"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(n int) {
+			defer wg.Done()
+			for j := 0; j < 50; j++ {
+				key := []byte("k")
+				value := []byte{byte(n), byte(j)}
+				if e := db.Put(key, value); e != nil {
+					t.Errorf("put: %v", e)
+					return
+				}
+				if _, e := db.Get(key); e != nil {
+					t.Errorf("get: %v", e)
+					return
+				}
+			}
+		}(i)
+	}
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if e := db.Compact(); e != nil {
+				t.Errorf("compact: %v", e)
+			}
+		}()
+	}
+	wg.Wait()
+	if _, err = db.Get([]byte("k")); err != nil {
+		t.Fatal(err)
+	}
 }

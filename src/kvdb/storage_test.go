@@ -5,9 +5,11 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -416,4 +418,258 @@ func openStorageFromMemory(f *memoryFile) (*storage, map[string]diskRecord, erro
 	index := map[string]diskRecord{}
 	err := s.recover(index)
 	return s, index, err
+}
+
+func TestCompactionCrashBoundariesRecover(t *testing.T) {
+	if os.Getenv("KVDB_COMPACTION_CRASH_HELPER") == "1" {
+		path := os.Getenv("KVDB_COMPACTION_PATH")
+		point := os.Getenv("KVDB_COMPACTION_CRASH_POINT")
+		compactionHook = func(name string) {
+			if name == point {
+				os.Exit(91)
+			}
+		}
+		db, err := Open(path, 0)
+		if err != nil {
+			os.Exit(92)
+		}
+		_ = db.Compact()
+		os.Exit(93)
+	}
+
+	points := []string{"before-temp", "after-temp-sync", "after-replacement", "before-backup-delete"}
+	for _, point := range points {
+		t.Run(point, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "db.kv")
+			db, err := Open(path, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err = db.Put([]byte("keep"), []byte("value")); err != nil {
+				t.Fatal(err)
+			}
+			if err = db.Put([]byte("gone"), []byte("x")); err != nil {
+				t.Fatal(err)
+			}
+			if err = db.Delete([]byte("gone")); err != nil {
+				t.Fatal(err)
+			}
+			if err = db.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			cmd := exec.Command(os.Args[0], "-test.run=TestCompactionCrashBoundariesRecover")
+			cmd.Env = append(os.Environ(), "KVDB_COMPACTION_CRASH_HELPER=1", "KVDB_COMPACTION_PATH="+path, "KVDB_COMPACTION_CRASH_POINT="+point)
+			err = cmd.Run()
+			if exit, ok := err.(*exec.ExitError); !ok || exit.ExitCode() != 91 {
+				t.Fatalf("helper did not terminate at crash point: %v", err)
+			}
+
+			reopened, err := Open(path, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer reopened.Close()
+			v, err := reopened.Get([]byte("keep"))
+			if err != nil || string(v) != "value" {
+				t.Fatalf("keep lost after %s: %q %v", point, v, err)
+			}
+			if _, err = reopened.Get([]byte("gone")); !errors.Is(err, ErrNotFound) {
+				t.Fatalf("deleted key resurrected after %s: %v", point, err)
+			}
+			if err = reopened.Put([]byte("new"), []byte("ok")); err != nil {
+				t.Fatalf("database not writable after %s: %v", point, err)
+			}
+		})
+	}
+}
+
+func TestRecoverySelectsOnlyValidatedCandidates(t *testing.T) {
+	makeDBFile := func(t *testing.T, path, key, value string) {
+		t.Helper()
+		s, _, err := openStorage(path, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = s.commit([]Operation{{Type: Put, Key: []byte(key), Value: []byte(value)}}); err != nil {
+			t.Fatal(err)
+		}
+		if err = s.close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	states := []string{"original", "tmp-only", "original-plus-backup", "backup-plus-tmp", "new-plus-backup", "new-only", "missing-with-backup", "corrupt-with-backup"}
+	for _, state := range states {
+		t.Run(state, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "db.kv")
+			backup := path + ".compact-old"
+			tmp := path + ".compact-tmp"
+			makeDBFile(t, path, "keep", "old")
+			newPath := filepath.Join(dir, "new.kv")
+			makeDBFile(t, newPath, "keep", "new")
+			newBytes, err := os.ReadFile(newPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			oldBytes, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch state {
+			case "tmp-only":
+				os.Remove(path)
+				os.WriteFile(tmp, newBytes, 0600)
+			case "original-plus-backup":
+				os.WriteFile(backup, newBytes, 0600)
+			case "backup-plus-tmp":
+				os.Remove(path)
+				os.WriteFile(backup, oldBytes, 0600)
+				os.WriteFile(tmp, newBytes, 0600)
+			case "new-plus-backup":
+				os.WriteFile(path, newBytes, 0600)
+				os.WriteFile(backup, oldBytes, 0600)
+			case "new-only":
+				os.WriteFile(path, newBytes, 0600)
+			case "missing-with-backup":
+				os.Remove(path)
+				os.WriteFile(backup, oldBytes, 0600)
+			case "corrupt-with-backup":
+				os.WriteFile(path, []byte("corrupt"), 0600)
+				os.WriteFile(backup, oldBytes, 0600)
+			}
+			db, err := Open(path, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer db.Close()
+			v, err := db.Get([]byte("keep"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := "old"
+			if state == "tmp-only" || state == "new-plus-backup" || state == "new-only" {
+				want = "new"
+			}
+			if string(v) != want {
+				t.Fatalf("state %s selected %q, want %q", state, v, want)
+			}
+			if _, err = os.Stat(backup); err == nil {
+				t.Fatalf("backup remained authoritative after %s", state)
+			}
+		})
+	}
+}
+
+func TestCheckpointValidationAndLegacyDetection(t *testing.T) {
+	base, err := makeCheckpoint(map[string][]byte{"a": []byte("1")}, 7, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string][]byte{
+		"checksum corruption":  append([]byte(nil), base...),
+		"truncated checkpoint": base[:len(base)-1],
+		"unknown magic":        append([]byte("UNKNOWN!"), base[8:]...),
+	}
+	tests["checksum corruption"][20] ^= 1
+	for name, data := range tests {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "db.kv")
+			if err := os.WriteFile(path, data, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, _, err := openStorage(path, 0); err == nil {
+				t.Fatal("corrupt checkpoint was accepted")
+			}
+		})
+	}
+	t.Run("short checkpoint header", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "db.kv")
+		if err := os.WriteFile(path, []byte("KVCPv003"), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := openStorage(path, 0); err == nil {
+			t.Fatal("short checkpoint was accepted")
+		}
+	})
+	t.Run("oversized payload", func(t *testing.T) {
+		data := make([]byte, checkpointHeaderSize+checkpointTrailerSize)
+		copy(data[:8], checkpointMagic)
+		binary.LittleEndian.PutUint16(data[8:10], 3)
+		binary.LittleEndian.PutUint16(data[10:12], checkpointHeaderSize)
+		binary.LittleEndian.PutUint64(data[12:20], 1)
+		binary.LittleEndian.PutUint64(data[20:28], 1)
+		binary.LittleEndian.PutUint64(data[28:36], 1)
+		binary.LittleEndian.PutUint64(data[36:44], maxCheckpointSize+1)
+		binary.LittleEndian.PutUint32(data[48:52], crc32.Checksum(data[:48], castagnoliTable))
+		path := filepath.Join(t.TempDir(), "db.kv")
+		if err := os.WriteFile(path, data, 0600); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := openStorage(path, 0); err == nil {
+			t.Fatal("oversized checkpoint was accepted")
+		}
+	})
+}
+
+func TestCheckpointReplayBoundaryAndMalformedTail(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "db.kv")
+	db, err := Open(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Batch([]Operation{{Type: Put, Key: []byte("old"), Value: []byte("1")}, {Type: Put, Key: []byte("gone"), Value: []byte("x")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Delete([]byte("gone")); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Compact(); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Batch([]Operation{{Type: Put, Key: []byte("new"), Value: []byte("2")}, {Type: Delete, Key: []byte("old")}}); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened, err := Open(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = reopened.Get([]byte("old")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("old key survived: %v", err)
+	}
+	if _, err = reopened.Get([]byte("gone")); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted key resurrected: %v", err)
+	}
+	if v, e := reopened.Get([]byte("new")); e != nil || string(v) != "2" {
+		t.Fatalf("new key missing: %q %v", v, e)
+	}
+	reopened.Close()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, 4, 0, 0, 0, '{', 'b', 'a', 'd')
+	if err = os.WriteFile(path, data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = Open(path, 0); err == nil {
+		t.Fatal("complete malformed post-checkpoint record was ignored")
+	}
+}
+
+func TestCheckpointMillionEntryCount(t *testing.T) {
+	values := make(map[string][]byte, 1_000_000)
+	for i := 0; i < 1_000_000; i++ {
+		values[fmt.Sprintf("k%07d", i)] = []byte("v")
+	}
+	frame, err := makeCheckpoint(values, 9, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(frame) == 0 {
+		t.Fatal("empty checkpoint")
+	}
 }
