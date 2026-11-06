@@ -200,6 +200,14 @@ func serve(a []string) {
 		}
 		op := strings.ToUpper(req.Op)
 		switch op {
+		case "COMPACT":
+			if err := db.Compact(); err != nil {
+				if !writeServeError(out, req.ID, err, db.RecoveryRequired()) {
+					return
+				}
+			} else {
+				writeServeResponse(out, serveResponse{ID: req.ID, Status: "ACK"})
+			}
 		case "PUT", "GET", "DELETE":
 			if err := validateEncodedKey(req.Key); err != nil {
 				writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: err.Error()})
@@ -211,7 +219,7 @@ func serve(a []string) {
 				if err == kvdb.ErrNotFound {
 					writeServeResponse(out, serveResponse{ID: req.ID, Status: "NOT_FOUND"})
 				} else if err != nil {
-					if !writeServeError(out, req.ID, err) {
+					if !writeServeError(out, req.ID, err, db.RecoveryRequired()) {
 						return
 					}
 				} else {
@@ -230,7 +238,7 @@ func serve(a []string) {
 				}
 				value, _ := base64.StdEncoding.DecodeString(req.Value)
 				if err := db.Put(key, value); err != nil {
-					if !writeServeError(out, req.ID, err) {
+					if !writeServeError(out, req.ID, err, db.RecoveryRequired()) {
 						return
 					}
 				} else {
@@ -238,7 +246,7 @@ func serve(a []string) {
 				}
 			} else {
 				if err := db.Delete(key); err != nil {
-					if !writeServeError(out, req.ID, err) {
+					if !writeServeError(out, req.ID, err, db.RecoveryRequired()) {
 						return
 					}
 				} else {
@@ -252,7 +260,7 @@ func serve(a []string) {
 				continue
 			}
 			if err = db.Batch(ops); err != nil {
-				if !writeServeError(out, req.ID, err) {
+				if !writeServeError(out, req.ID, err, db.RecoveryRequired()) {
 					return
 				}
 			} else {
@@ -304,8 +312,8 @@ func writeServeResponse(w *bufio.Writer, response serveResponse) {
 	_, _ = w.Write(append(b, '\n'))
 	_ = w.Flush()
 }
-func writeServeError(w *bufio.Writer, id json.RawMessage, err error) bool {
-	if err == kvdb.ErrRecoveryRequired || (dbRecoveryError(err)) {
+func writeServeError(w *bufio.Writer, id json.RawMessage, err error, recoveryRequired bool) bool {
+	if recoveryRequired || err == kvdb.ErrRecoveryRequired || dbRecoveryError(err) {
 		writeServeResponse(w, serveResponse{ID: id, Status: "ERROR", Outcome: "UNKNOWN", Error: "Commit outcome uncertain; database requires recovery"})
 		return false
 	}
