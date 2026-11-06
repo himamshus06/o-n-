@@ -1,96 +1,92 @@
-# Crash points, recovery, and known weaknesses
+# Crash points, recovery, and known limits
 
-## Write ordering
+## Crash-point table
 
-```text
-validate -> append operations -> append commit -> File.Sync()
--> update map -> success/ACK
-```
+The table describes implementation behavior. “Not verified” means the exact
+process-kill boundary was not exercised; it is not a claim that the mechanism
+is safe under every power-loss condition.
 
-The map is not updated before synchronization. A batch is not visible in an intermediate state. If rollback or rollback synchronization fails, storage is poisoned and writes are rejected with `ErrRecoveryRequired`. The JSONL layer reports an UNKNOWN outcome and stops serving normal requests.
+| Point | Source function | Possible disk state | Recovery action / evidence |
+|---|---|---|---|
+| PUT/DELETE operation write fails | `src/kvdb/storage.go: storage.commit`, `rollbackAfterFailure` | Partial append or no append | Truncate, seek, and sync back to the original size; rollback tests pass. Exact process kill: not verified. |
+| Commit marker write fails | `storage.commit`, `rollbackAfterFailure` | Operation records without a commit marker | Roll back; recovery does not apply the pending transaction. `TestCommitHandlesShortWritesAndRollsBackFailures`. |
+| Commit marker exists before `File.Sync` returns | `storage.commit`, `scanFrom` | A complete committed transaction may be present, or the tail may be incomplete | Recovery uses the physical valid commit marker, not knowledge of whether sync returned: it replays a complete committed group or ignores an uncommitted group. Exact kill: not verified. |
+| Sync failure after append | `storage.commit`, `rollbackAfterFailure`; `DB.Batch`; `writeServeError` | Append may have reached the file; commit outcome is uncertain | Rollback is attempted, storage is poisoned, JSONL returns `ERROR`/`UNKNOWN`, and serving stops. Executable injected-sync tests cover this path. |
+| Incomplete final record during open | `recover`, `scanFrom`, `incompleteTail` | Physically truncated final frame | Repair is allowed only for an incomplete physical tail; complete malformed records are rejected. `TestRecoveryRepairsOnlyIncompleteTails`. |
+| Complete malformed record during open | `scanFrom`, `validateRecord` | Complete but invalid JSON/checksum/structure | Open fails; the record is not silently discarded. `TestRecoveryRejectsChecksumAndStructuralCorruption`, `TestRecordValidationRejectsMalformedFrames`. |
+| Batch lacks its commit marker | `storage.commit`, `scanFrom` | Some or all operation records, no commit marker | Pending operations remain invisible after recovery. Exact halfway process kill: not verified. |
+| Batch commit succeeds before caller returns | `DB.Batch`, `storage.commit`, `recover` | Synced committed batch, but caller may receive no response if killed | Reopen replays the committed batch. Exact post-ACK kill: not verified. `TestBatchLastOperationWins` verifies ordering, not this kill boundary. |
+| Temporary checkpoint write/sync fails | `storage.compactLocked` | A handled write, sync, close, or validation error can leave an incomplete `.compact-tmp` | Error paths attempt to close/remove `.compact-tmp`; a process crash can leave a partial temporary candidate, which `openStorage` validates or discards. `TestCompactionCrashBoundariesRecover`. |
+| Replacement is interrupted | `replace_windows.go: replaceAuthoritative`; `replace_other.go: replaceAuthoritative`; `openStorage` | Windows uses one `ReplaceFileW` operation; the portable path can leave the old path, `.compact-old`, or `.compact-tmp` at an interruption boundary | On open, existing path, backup, and temporary candidates are validated. If the base is missing/invalid, a valid backup is preferred; if the base is missing and backup is invalid, a valid temporary candidate can be renamed into place. A valid base is otherwise recovered, then temporary/backup cleanup is attempted. |
+| Crash after replacement before backup cleanup | `compactLocked`, `openStorage` | New authoritative checkpoint plus `.compact-old` | New file is reopened and validated on recovery; backup is removed only after successful open/recovery. `TestCompactionCrashBoundariesRecover`. |
+| Crash during close | `storage.close`, `DB.Close`, `recover` | File sync/close may be in progress | Close syncs while storage is healthy; reopen performs normal recovery. Exact close-time process kill: not verified. |
 
-## Recovery behavior
+## Write-ordering argument
 
-- Valid `KVCPv003` checkpoints load from offset zero.
-- Only newer committed JSON transactions replay.
-- Uncommitted groups are ignored.
-- Complete malformed records and checksum failures are rejected.
-- Physically incomplete final frames may be repaired.
-- Non-checkpoint files use legacy full-log recovery.
+`DB.Put` and `DB.Delete` delegate to `DB.Batch`. The storage layer calculates
+the complete transaction size, records the original file size, writes each
+operation record, writes the commit marker, and calls `File.Sync`. Only after a
+successful sync does it advance the transaction ID. Only after `storage.commit`
+returns success does `DB.Batch` update the in-memory map; only then can JSONL
+emit `ACK`.
 
-## Tested crash/failure points
+Thus an acknowledged operation has passed the file sync and map update before
+success is reported. A transaction can be committed on disk but unacknowledged
+if the process dies after sync and before the response; recovery replays a
+committed transaction if
+the complete commit marker is present. An incomplete or uncommitted transaction
+has no matching commit marker and is withheld from the recovered index. A sync
+failure is different: its outcome is uncertain, rollback is attempted, storage
+is poisoned, and the JSONL server reports `UNKNOWN` rather than a false ACK.
 
-Go tests cover short writes, operation-record failure, commit-marker failure, rollback failure, rollback-sync failure, transaction sync failure, incomplete-tail repair, checkpoint corruption/truncation, malformed post-checkpoint records, and compaction replacement boundaries through subprocess termination hooks. They also cover backup/temp-file recovery states.
-
-Actual Go executable tests cover process kill/restart, READY recovery, survival
-of acknowledged data, and injected sync failure through a dedicated test build.
-The real OS-level ENOSPC experiment below is separate from sync-failure
-injection.
-
-## Theoretical or incomplete coverage
-
-These scenarios are reasoned about but are not equivalent to arbitrary power-loss testing:
-
-- Power loss while Windows directory metadata is being persisted.
-- Every internal byte-level step of `ReplaceFileW`.
-- Every possible disk-full and rollback-failure combination.
-- A production serve-process sync failure caused by an OS or hardware fault.
+The DB write lock makes a batch’s map update atomic to readers. Compaction
+holds that lock, snapshots the committed map and transaction boundary, writes
+`.compact-tmp`, syncs and closes it, reopens and independently validates the
+checkpoint, then performs the platform replacement while retaining
+`.compact-old`. The replacement file is reopened before backup cleanup. On
+Windows, directory-entry synchronization is a no-op in this implementation;
+rename metadata durability is therefore weaker than on platforms where the
+directory can be synced.
 
 ## Known weaknesses
 
-1. One-million-key recovery remains sensitive to runtime and host load; the latest five-run mean was 1,898 ms, with individual runs from 1,854 to 1,955 ms.
-2. The active index is a copied `map[string][]byte`, not a physical record-location index.
-3. Windows directory-entry durability cannot be forced through the current portable implementation.
-4. Rollback failure itself was not independently injected under actual ENOSPC.
-5. Race detection covers only the execution paths exercised by the test suite.
-6. The CLI does not persist `maxBytes` between independent commands.
+- Five one-million-key recovery runs averaged 1,898 ms (1,854–1,955 ms). The mean
+  met the two-second target, but runtime and host load still affect individual
+  runs; allocation profiling remained approximately 937 MB.
+- The live index is `map[string][]byte`, not a physical record-location index,
+  so memory use scales with key/value data.
+- Windows directory metadata cannot be durably synchronized through the
+  current portable implementation.
+- Rollback failure was tested with storage doubles, but was not independently
+  injected under genuine ENOSPC.
+- `maxBytes` is supplied to each open and is not persisted across independent
+  CLI invocations.
+- Race detection covers only the test paths exercised by the WSL2 race run;
+  it does not prove all possible schedules or filesystem failures.
 
-The JSONL protocol now includes the additive maintenance operation `COMPACT`. Existing CRUD, BATCH, GET, DELETE, and DUMP clients remain compatible.
+## What failed / lessons learned
 
-## Verified real ENOSPC experiment
+- The initial JSONL scanner limit was 4 MiB. Large requests required a larger
+  scanner bound; the current server uses a 16 MiB maximum.
+- Profiling showed normal checkpoint recovery validated the authoritative file
+  twice, rebuilding the million-entry index twice. The normal path now performs
+  one definitive validation when no replacement artifacts exist, while backup
+  and temporary candidates remain independently validated.
+- Earlier checkpoint recovery measurements were about 27.5 seconds, then about
+  3.06 seconds after checkpointing. The validation optimization produced the
+  latest five-run mean of 1.898 seconds without changing the checkpoint format
+  or validation rules.
+- Windows replacement and directory synchronization cannot be treated as
+  identical to POSIX rename plus directory fsync; the limitation remains
+  documented rather than hidden.
 
-Ubuntu WSL 2 used an isolated 128 MB ext4 loopback filesystem containing
-`/mnt/kvdb-enospc/test.kv`. After acknowledging `acknowledged=original` and a
-1 MB `oversized` value, the filesystem was filled until approximately 684 KB
-remained. A batch containing `batch-a`, `batch-b`, and `batch-c` failed with the
-genuine Linux error:
+## Next 24-hour improvements
 
-`write /mnt/kvdb-enospc/test.kv: no space left on device`
-
-After reopening, the two acknowledged values were intact, all three batch keys
-were absent, integrity check returned `OK`, and a subsequent write succeeded
-after freeing space. This validates the tested write-error rollback path, not
-all possible disk-full or rollback-failure scenarios. It is distinct from the
-configured `maxBytes` test.
-
-## Verified race detection
-
-`CGO_ENABLED=1 go test -race ./...` passed under Ubuntu WSL 2 for all tested
-packages, with no reported data races. The result covers only paths exercised
-by the test suite.
-
-The command completed with the following package results:
-
-| Package | Result |
-|---|---|
-| `killitandproveit/src/cmd/kvdb` | Passed — 16.273s |
-| `killitandproveit/src/kvdb` | Passed — 11.013s |
-| `killitandproveit/tests` | Passed — 1.089s |
-| `src/cmd/recoverybench` | No test files |
-| `src/cmd/recoveryprofile` | No test files |
-
-No data races were reported in the tested execution paths.
-
-## Recovery optimization evidence
-
-Profiling found duplicate million-entry checkpoint validation and index
-reconstruction on the normal open path. The implementation now performs one
-definitive validation when no replacement artifacts exist, while retaining
-independent validation for backup/temp candidates. The latest five runs were
-1,854 ms, 1,955 ms, 1,876 ms, 1,874 ms, and 1,931 ms; mean 1,898 ms. All runs
-recovered 1,000,000 keys with the same checksum. Allocation profiling fell
-from approximately 1.49 GB to 937 MB.
-
-## Compaction
-
-Compaction synchronizes and independently validates `.compact-tmp`, then uses Windows `ReplaceFileW` or the portable fallback while retaining `.compact-old`. A missing authoritative path is restored from the backup during open. The backup is not an independent authority after successful recovery.
+1. Add a controlled executable-level crash matrix for the still-unverified
+   write, batch, recovery, and close boundaries, with acknowledged-operation
+   tracking and conservative UNKNOWN handling.
+2. Add a supported Linux/WSL ENOSPC harness that separately exercises rollback
+   failure and compaction-space exhaustion without touching the host volume.
+3. Add a bounded index/checkpoint memory study and evaluate a record-location
+   index only if profiling shows it reduces the remaining recovery and memory
+   risk without weakening validation.

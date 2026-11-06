@@ -34,6 +34,110 @@ func TestServeValidation(t *testing.T) {
 	if ops, err := decodeBatch([]serveBatchOperation{{Op: "PUT", Key: key, Value: &value}, {Op: "DELETE", Key: key}}); err != nil || len(ops) != 2 {
 		t.Fatalf("batch validation: %v %#v", err, ops)
 	}
+	empty := ""
+	if ops, err := decodeBatch([]serveBatchOperation{{Op: "PUT", Key: key, Value: &empty}}); err != nil || len(ops) != 1 || len(ops[0].Value) != 0 {
+		t.Fatalf("empty batch value: %v %#v", err, ops)
+	}
+	if _, err := decodeBatch([]serveBatchOperation{{Op: "PUT", Key: key}}); err == nil {
+		t.Fatal("accepted batch PUT with missing value")
+	}
+}
+
+func TestServeEmptyValuesSurviveRestart(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "empty-values.kv")
+	exe := filepath.Join(dir, "kvdb-empty.exe")
+	if out, err := exec.Command("go", "build", "-o", exe, ".").CombinedOutput(); err != nil {
+		t.Fatalf("build: %v\n%s", err, out)
+	}
+	start := func() (*exec.Cmd, io.WriteCloser, *bufio.Scanner) {
+		cmd := exec.Command(exe, "serve", dbPath)
+		in, err := cmd.StdinPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out, err := cmd.StdoutPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		errout, err := cmd.StderrPipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		ready := bufio.NewScanner(errout)
+		if !ready.Scan() || ready.Text() != "READY" {
+			t.Fatal("server did not become ready")
+		}
+		return cmd, in, bufio.NewScanner(out)
+	}
+	request := func(in io.Writer, out *bufio.Scanner, line string) string {
+		if _, err := io.WriteString(in, line+"\n"); err != nil {
+			t.Fatal(err)
+		}
+		if !out.Scan() {
+			t.Fatalf("missing response for %s", line)
+		}
+		return out.Text()
+	}
+	cmd, in, out := start()
+	if got := request(in, out, `{"id":1,"op":"PUT","key":"YQ==","value":"MQ=="}`); !strings.Contains(got, `"status":"ACK"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":2,"op":"PUT","key":"YQ==","value":""}`); !strings.Contains(got, `"status":"ACK"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":3,"op":"GET","key":"YQ=="}`); !strings.Contains(got, `"status":"VALUE"`) || !strings.Contains(got, `"value":""`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":4,"op":"PUT","key":"YQ==","value":"Mg=="}`); !strings.Contains(got, `"status":"ACK"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":5,"op":"PUT","key":"Yg==","value":""}`); !strings.Contains(got, `"status":"ACK"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":6,"op":"GET","key":"Yg=="}`); !strings.Contains(got, `"status":"VALUE"`) || !strings.Contains(got, `"value":""`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":7,"op":"PUT","key":"Yw=="}`); !strings.Contains(got, `"status":"ERROR"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":8,"op":"PUT","key":"Yw==","value":null}`); !strings.Contains(got, `"status":"ERROR"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":9,"op":"PUT","key":"Yw==","value":"%%%"}`); !strings.Contains(got, `"status":"ERROR"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":10,"op":"BATCH","operations":[{"op":"PUT","key":"ZA==","value":""},{"op":"PUT","key":"ZQ==","value":"Mw=="}]}`); !strings.Contains(got, `"status":"ACK"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":11,"op":"BATCH","operations":[{"op":"PUT","key":"Zg=="}]}`); !strings.Contains(got, `"status":"ERROR"`) {
+		t.Fatal(got)
+	}
+	_ = in.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd, in, out = start()
+	if got := request(in, out, `{"id":12,"op":"GET","key":"YQ=="}`); !strings.Contains(got, `"value":"Mg=="`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":13,"op":"GET","key":"Yg=="}`); !strings.Contains(got, `"status":"VALUE"`) || !strings.Contains(got, `"value":""`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":14,"op":"GET","key":"ZA=="}`); !strings.Contains(got, `"status":"VALUE"`) || !strings.Contains(got, `"value":""`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":15,"op":"GET","key":"Zg=="}`); !strings.Contains(got, `"status":"NOT_FOUND"`) {
+		t.Fatal(got)
+	}
+	_ = in.Close()
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestServeExecutableSyncFailureUnknownAndRecovery(t *testing.T) {
