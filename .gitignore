@@ -1,0 +1,12 @@
+# Generated executables and benchmark outputs
+kvdb.exe
+kvdb-report-check.exe
+recoverybench.exe
+recoveryprofile.exe
+*.kv
+*.cpu
+*.mem
+
+# Python bytecode and caches
+**/__pycache__/
+*.py[cod]
