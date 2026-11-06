@@ -43,6 +43,7 @@ IDs may be JSON strings or non-negative integers and are echoed with their origi
 {"id":"3","op":"DELETE","key":"YXBwbGU="}
 {"id":"4","op":"BATCH","operations":[{"op":"PUT","key":"YQ==","value":"MQ=="},{"op":"DELETE","key":"Yg=="}]}
 {"id":"5","op":"DUMP"}
+{"id":"6","op":"COMPACT"}
 ```
 
 Responses include `ACK`, `VALUE`, `NOT_FOUND`, `DUMP`, and `ERROR`:
@@ -55,7 +56,7 @@ Responses include `ACK`, `VALUE`, `NOT_FOUND`, `DUMP`, and `ERROR`:
 {"id":"6","status":"ERROR","error":"Invalid request"}
 ```
 
-`BATCH` accepts PUT and DELETE only, up to 10,000 operations, and is all-or-nothing. `DUMP` returns committed live entries sorted by raw key bytes. An `ACK` is emitted only after the transaction has been synchronized successfully. An uncertain commit returns an UNKNOWN error and the serve process stops accepting normal work until the database is reopened:
+`BATCH` accepts PUT and DELETE only, up to 10,000 operations, and is all-or-nothing. `DUMP` returns committed live entries sorted by raw key bytes. `COMPACT` invokes the existing locked compaction path and returns `ACK` only after successful replacement. An `ACK` is emitted only after the transaction or maintenance operation has completed successfully. An uncertain commit returns an UNKNOWN error and the serve process stops accepting normal work until the database is reopened:
 
 ```json
 {"id":"7","status":"ERROR","outcome":"UNKNOWN","error":"Commit outcome uncertain; database requires recovery"}

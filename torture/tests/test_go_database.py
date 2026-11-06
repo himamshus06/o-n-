@@ -5,7 +5,7 @@ import unittest
 
 from oracle import Oracle
 from process import ProcessConfig, SubprocessDatabaseAdapter
-from protocol import BatchRequest, DeleteRequest, DumpRequest, GetRequest, NotFoundResponse, PutRequest, ValueResponse, Acknowledgement
+from protocol import BatchRequest, CompactRequest, DeleteRequest, DumpRequest, GetRequest, NotFoundResponse, PutRequest, ValueResponse, Acknowledgement
 
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
@@ -63,6 +63,29 @@ class GoDatabaseIntegrationTests(unittest.TestCase):
         self.adapter.crash()
         self.adapter.restart()
         self.assertEqual(self.adapter.send_request(GetRequest(2, b"persisted")), ValueResponse(2, b"value"))
+
+    def test_compaction_preserves_oracle_state_and_allows_followup_writes(self):
+        oracle = Oracle()
+        self.adapter = self.make_adapter()
+        self.adapter.start()
+        for key, value in ((b"keep", b"one"), (b"replace", b"old"), (b"delete", b"gone")):
+            request = PutRequest(key.decode(), key, value)
+            self.assertEqual(self.adapter.send_request(request), Acknowledgement(request.request_id))
+            oracle.apply_put(key, value)
+        delete = DeleteRequest("delete", b"delete")
+        self.assertEqual(self.adapter.send_request(delete), Acknowledgement("delete"))
+        oracle.apply_delete(b"delete")
+        self.assertEqual(self.adapter.send_request(CompactRequest("compact-1")), Acknowledgement("compact-1"))
+        oracle.verify_dump(self.adapter.send_request(DumpRequest("after-compact")))
+        followup = PutRequest("followup", b"after", b"compact")
+        self.assertEqual(self.adapter.send_request(followup), Acknowledgement("followup"))
+        oracle.apply_put(followup.key, followup.value)
+        self.assertEqual(self.adapter.send_request(CompactRequest("compact-2")), Acknowledgement("compact-2"))
+        oracle.verify_dump(self.adapter.send_request(DumpRequest("after-second-compact")))
+        self.adapter.graceful_shutdown()
+        self.adapter = self.make_adapter()
+        self.adapter.start()
+        oracle.verify_dump(self.adapter.send_request(DumpRequest("after-restart")))
 
 
 if __name__ == "__main__":

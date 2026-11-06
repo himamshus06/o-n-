@@ -119,7 +119,7 @@ func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, 
 	} else if !pathValid {
 		return nil, nil, fmt.Errorf("no valid authoritative database file")
 	}
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0600)
+	f, err := openStorageFile(path, os.O_RDWR|os.O_CREATE, 0600)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -145,7 +145,7 @@ func validStorageCandidate(path string) (valid, exists bool) {
 	if _, err := os.Stat(path); err != nil {
 		return false, false
 	}
-	f, err := os.OpenFile(path, os.O_RDWR, 0600)
+	f, err := openStorageFile(path, os.O_RDWR, 0600)
 	if err != nil {
 		return false, true
 	}
@@ -668,7 +668,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 	compactionPoint("before-temp")
 	_ = os.Remove(tmp)
 	_ = os.Remove(backup)
-	tf, err := os.OpenFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
+	tf, err := openStorageFile(tmp, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
 		return err
 	}
@@ -686,7 +686,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 		_ = os.Remove(tmp)
 		return err
 	}
-	validationFile, err := os.OpenFile(tmp, os.O_RDWR, 0600)
+	validationFile, err := openStorageFile(tmp, os.O_RDWR, 0600)
 	if err != nil {
 		_ = os.Remove(tmp)
 		return err
@@ -710,7 +710,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 	}
 	s.f = nil
 	if err = replaceAuthoritative(s.path, tmp, backup); err != nil {
-		s.f, _ = os.OpenFile(s.path, os.O_RDWR, 0600)
+		s.f, _ = openStorageFile(s.path, os.O_RDWR, 0600)
 		_ = os.Remove(tmp)
 		return err
 	}
@@ -719,7 +719,7 @@ func (s *storage) compactLocked(values map[string][]byte, checkpointTx uint64) e
 		// The new file is complete and authoritative; retain it, but report the
 		// directory durability limitation to the caller.
 	}
-	newFile, err := os.OpenFile(s.path, os.O_RDWR, 0600)
+	newFile, err := openStorageFile(s.path, os.O_RDWR, 0600)
 	if err != nil {
 		return err
 	}

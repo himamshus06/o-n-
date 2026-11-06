@@ -42,6 +42,8 @@ These scenarios are reasoned about but are not equivalent to arbitrary power-los
 5. Race-detector validation is unavailable in the current environment because CGO/GCC is unavailable.
 6. The CLI does not persist `maxBytes` between independent commands.
 
+The JSONL protocol now includes the additive maintenance operation `COMPACT`. Existing CRUD, BATCH, GET, DELETE, and DUMP clients remain compatible.
+
 ## Compaction
 
 Compaction synchronizes and independently validates `.compact-tmp`, then uses Windows `ReplaceFileW` or the portable fallback while retaining `.compact-old`. A missing authoritative path is restored from the backup during open. The backup is not an independent authority after successful recovery.

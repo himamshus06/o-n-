@@ -94,3 +94,5 @@ While holding the DB write lock, compaction captures the committed snapshot and 
 | F2 missing key | lookup | NOT_FOUND |
 | F3 uncertain outcome | ErrRecoveryRequired | UNKNOWN and serving stops |
 | F4 concurrent batch/read | DB RWMutex | No partial batch visibility |
+
+The additive JSONL maintenance request `{"id":"c1","op":"COMPACT"}` calls `DB.Compact()` through the same locking and replacement path. It exposes no storage internals and does not change the checkpoint format.
