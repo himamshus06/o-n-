@@ -1,0 +1,39 @@
+{
+  "date": "2026-11-07",
+  "optimization": "bounded checkpoint-count map preallocation and recovered DB map preallocation",
+  "files_changed": ["src/kvdb/storage.go", "src/kvdb/db.go"],
+  "dataset": {
+    "keys": 1000000,
+    "total_value_bytes": 14000000,
+    "database_bytes": 34000060,
+    "checkpoint_bytes": 34000060,
+    "checksum_sha256": "78f35e2f62e790a2c5a3dea427fa07ed5920c8f1a1ef14c0b61ad38716c81795",
+    "check": "OK"
+  },
+  "baseline": {
+    "runs_ms": [2579, 2222, 2294, 2504, 2294],
+    "mean_ms": 2378.6,
+    "median_ms": 2294,
+    "min_ms": 2222,
+    "max_ms": 2579,
+    "population_stddev_ms": 137.6
+  },
+  "optimized": {
+    "runs_ms": [1484, 1162, 1149, 1121, 1207],
+    "heap_delta_bytes": [309906424, 600033616, 599831656, 290511712, 599930136],
+    "mean_heap_delta_bytes": 480042708.8,
+    "mean_ms": 1224.6,
+    "median_ms": 1162,
+    "min_ms": 1121,
+    "max_ms": 1484,
+    "population_stddev_ms": 132.6,
+    "checksum_match_all_runs": true,
+    "under_two_seconds": true,
+    "cache_controlled": false
+  },
+  "profile": {
+    "optimized_recovery_ms": 1480,
+    "mapassign_faststr_cumulative_percent": 30.81,
+    "remaining_costs": "map control matching, memmove, allocation, and GC scanning"
+  }
+}

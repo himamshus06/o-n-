@@ -10,8 +10,10 @@ being represented by a simulator result.
 from __future__ import annotations
 
 import argparse
+import base64
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+import itertools
 import json
 import os
 from pathlib import Path
@@ -30,6 +32,7 @@ from protocol import (
     Acknowledgement,
     BatchRequest,
     CompactRequest,
+    CloseRequest,
     DeleteRequest,
     DumpRequest,
     ErrorResponse,
@@ -39,12 +42,12 @@ from protocol import (
 )
 from runner import WorkloadRunner
 from workload import WorkloadConfig, WorkloadGenerator
+from linearizability import CheckResult, check_history, history_operation
 
 ENOSPC_BATCH_VALUE_SIZE = 256 * 1024
 ENOSPC_BATCH_BUDGET = 400_000
 PERMANENTLY_UNTESTED = (
     "physical disk exhaustion",
-    "linearizability checking",
 )
 LEGACY_MODE_NOT_TESTED_LABELS = {
     "recovery-crash mode",
@@ -83,6 +86,11 @@ class CampaignReport:
     unknown_outcomes: int = 0
     integrity_check_failures: int = 0
     batch_atomicity_failures: int = 0
+    harness_active_kills: int = 0
+    idle_kills: int = 0
+    storage_phase_kills: int = 0
+    operation_lifecycles: list[dict[str, object]] = field(default_factory=list)
+    linearizability_results: list[dict[str, object]] = field(default_factory=list)
     crash_events: list[dict[str, object]] = field(default_factory=list)
     finished_utc: str = ""
     duration_seconds: float = 0.0
@@ -158,6 +166,10 @@ def render_markdown(report: CampaignReport) -> str:
         f"- Oracle mismatches: {report.oracle_mismatches}",
         f"- Integrity-check failures: {report.integrity_check_failures}",
         f"- Batch-atomicity failures: {report.batch_atomicity_failures}",
+        f"- Harness-active kills (not storage-confirmed): {report.harness_active_kills}",
+        f"- Idle kills: {report.idle_kills}",
+        f"- Storage-phase kills: {report.storage_phase_kills}",
+        f"- Linearizability results: {json.dumps(report.linearizability_results, sort_keys=True)}",
         "",
         "## Crash events",
         *[f"- {json.dumps(item, sort_keys=True)}" for item in report.crash_events],
@@ -380,6 +392,476 @@ def _apply_to_copy(oracle: Oracle, request) -> Oracle:
     return candidate
 
 
+def _permitted_concurrent_states(base: Oracle, requests: list) -> list[Oracle]:
+    """Enumerate acknowledged plus independently optional unacknowledged effects."""
+    states = []
+    for mask in range(1 << len(requests)):
+        candidate = Oracle(base.snapshot())
+        for index, request in enumerate(requests):
+            if mask & (1 << index):
+                candidate = _apply_to_copy(candidate, request)
+        states.append(candidate)
+    return states
+
+
+def _run_concurrent_storage_crashes(
+    executable: Path,
+    probe_executable: Path,
+    report: CampaignReport,
+) -> None:
+    """Run two concurrent transport writers while gating one storage commit."""
+    cases = (
+        ("put-append", "STORAGE_APPEND_BEGIN", PutRequest("cw-put", b"cw-put", b"value")),
+        ("put-sync", "STORAGE_SYNC_BEGIN", PutRequest("cw-sync", b"cw-sync", b"value")),
+        ("delete-append", "STORAGE_APPEND_BEGIN", DeleteRequest("cw-delete", b"cw-delete")),
+        (
+            "batch-append",
+            "STORAGE_APPEND_BEGIN",
+            BatchRequest("cw-batch-a", (PutRequest("cw-a", b"cw-a", b"a"), PutRequest("cw-b", b"cw-b", b"b"))),
+        ),
+        (
+            "batch-sync",
+            "STORAGE_SYNC_BEGIN",
+            BatchRequest("cw-batch-s", (PutRequest("cw-s", b"cw-s", b"s"), PutRequest("cw-t", b"cw-t", b"t"))),
+        ),
+    )
+    for label, wanted_event, selected in cases:
+        with tempfile.TemporaryDirectory(prefix=f"kvdb-concurrent-probe-{label}-") as raw:
+            directory = Path(raw)
+            event_file = directory / "crashprobe.jsonl"
+            gate_file = directory / "release-gate"
+            adapter = _adapter(
+                probe_executable,
+                directory,
+                {
+                    "KVDB_CRASHPROBE_FILE": str(event_file),
+                    "KVDB_CRASHPROBE_GATE": str(gate_file),
+                    "KVDB_CRASHPROBE_GATE_EVENT": wanted_event,
+                },
+            )
+            controller = DatabaseController(adapter)
+            oracle = Oracle()
+            active: dict[str, dict[str, object]] = {}
+            active_lock = threading.Lock()
+            results: dict[str, object] = {}
+            other = PutRequest(f"{label}-other", f"{label}-other".encode(), b"other")
+            requests = [("writer-1", selected), ("writer-2", other)]
+            try:
+                controller.start()
+
+                def writer(writer_id: str, request) -> None:
+                    lifecycle = {
+                        "operation_id": request.request_id,
+                        "writer_id": writer_id,
+                        "operation_type": type(request).__name__,
+                        "invoked_ns": time.monotonic_ns(),
+                        "completed_ns": None,
+                        "acknowledged": False,
+                    }
+                    with active_lock:
+                        active[request.request_id] = lifecycle
+                    try:
+                        results[request.request_id] = adapter.execute(request)
+                    except Exception as exc:
+                        results[request.request_id] = exc
+                    finally:
+                        lifecycle["completed_ns"] = time.monotonic_ns()
+                        lifecycle["acknowledged"] = isinstance(results.get(request.request_id), Acknowledgement)
+                        with active_lock:
+                            active.pop(request.request_id, None)
+                        report.operation_lifecycles.append(dict(lifecycle))
+
+                threads = [threading.Thread(target=writer, args=item, daemon=True) for item in requests]
+                for thread in threads:
+                    thread.start()
+                deadline = time.monotonic() + 10.0
+                observed = None
+                while time.monotonic() < deadline:
+                    if event_file.exists():
+                        for line in event_file.read_text(encoding="utf-8").splitlines():
+                            try:
+                                event = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if event.get("operation_id") == selected.request_id and event.get("event") == wanted_event:
+                                observed = event
+                                break
+                    if observed is not None:
+                        break
+                    time.sleep(0.001)
+                if observed is None:
+                    raise AssertionError(f"{label} storage event {wanted_event} was not observed")
+                with active_lock:
+                    active_at_kill = [dict(item) for item in active.values()]
+                controller.crash()
+                report.crashes += 1
+                for thread in threads:
+                    thread.join(timeout=2.0)
+                controller.start()
+                report.restarts += 1
+                _check(executable, directory / "database.kv")
+                unacknowledged = []
+                for _, request in requests:
+                    response = results.get(request.request_id)
+                    if isinstance(response, Acknowledgement):
+                        oracle.apply_confirmed_write(request, response)
+                        report.acknowledged_writes += 1
+                    else:
+                        unacknowledged.append(request)
+                permitted = _permitted_concurrent_states(oracle, unacknowledged)
+                _verify_permitted_states(adapter, permitted)
+                report.operations_attempted += len(requests)
+                report.storage_phase_kills += 1
+                report.crash_events.append({
+                    "kind": "concurrent-storage-phase",
+                    "case": label,
+                    "event": wanted_event,
+                    "killed_operation_id": selected.request_id,
+                    "probe_event": observed,
+                    "active_operations_at_kill": active_at_kill,
+                    "writer_count": 2,
+                    "acknowledged_operations": [
+                        request.request_id for _, request in requests
+                        if isinstance(results.get(request.request_id), Acknowledgement)
+                    ],
+                })
+                report.passed.append(f"concurrent-{label}")
+            except Exception as exc:
+                report.failed.append({"mode": f"concurrent-{label}", "error": str(exc)})
+            finally:
+                if controller.is_ready():
+                    controller.stop()
+
+
+def _run_gated_large_case(
+    executable: Path,
+    probe_executable: Path,
+    report: CampaignReport,
+    label: str,
+    wanted_event: str,
+    request,
+) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"kvdb-{label}-") as raw:
+        directory = Path(raw)
+        database = directory / "database.kv"
+        baseline = Oracle()
+        seed_adapter = _adapter(executable, directory)
+        seed_controller = DatabaseController(seed_adapter)
+        seed_controller.start()
+        try:
+            for index in range(4):
+                seed_request = PutRequest(
+                    f"{label}-baseline-{index}",
+                    f"{label}-baseline-{index}".encode(),
+                    f"baseline-{index}".encode(),
+                )
+                response = seed_adapter.execute(seed_request)
+                if not isinstance(response, Acknowledgement):
+                    raise AssertionError(f"baseline write was not acknowledged: {response!r}")
+                baseline.apply_confirmed_write(seed_request, response)
+                report.acknowledged_writes += 1
+                report.operations_attempted += 1
+        finally:
+            if seed_controller.is_ready():
+                seed_controller.stop()
+
+        event_file = directory / "crashprobe.jsonl"
+        gate_file = directory / "release-gate"
+        adapter = _adapter(
+            probe_executable,
+            directory,
+            {
+                "KVDB_CRASHPROBE_FILE": str(event_file),
+                "KVDB_CRASHPROBE_GATE": str(gate_file),
+                "KVDB_CRASHPROBE_GATE_EVENT": wanted_event,
+            },
+        )
+        controller = DatabaseController(adapter)
+        result: dict[str, object] = {}
+        try:
+            controller.start()
+
+            def send() -> None:
+                try:
+                    result["response"] = adapter.execute(request)
+                except Exception as exc:
+                    result["error"] = exc
+
+            sender = threading.Thread(target=send, daemon=True)
+            sender.start()
+            deadline = time.monotonic() + 30.0
+            observed = None
+            while time.monotonic() < deadline:
+                if event_file.exists():
+                    for line in event_file.read_text(encoding="utf-8").splitlines():
+                        try:
+                            event = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        if event.get("operation_id") == request.request_id and event.get("event") == wanted_event:
+                            observed = event
+                            break
+                if observed is not None:
+                    break
+                time.sleep(0.001)
+            if observed is None:
+                raise AssertionError(f"{label}: storage event {wanted_event} was not observed")
+            kill_timestamp = time.time_ns()
+            controller.crash()
+            report.crashes += 1
+            sender.join(timeout=3.0)
+            controller.start()
+            report.restarts += 1
+            _check(executable, database)
+            response = result.get("response")
+            acknowledged = isinstance(response, Acknowledgement)
+            if acknowledged:
+                baseline.apply_confirmed_write(request, response)
+                report.acknowledged_writes += 1
+            permitted = [baseline]
+            if not acknowledged:
+                permitted.append(_apply_to_copy(baseline, request))
+            _verify_permitted_states(adapter, permitted)
+            report.storage_phase_kills += 1
+            report.crash_events.append(
+                {
+                    "kind": label,
+                    "seed": report.seed,
+                    "operation_id": request.request_id,
+                    "operation_type": type(request).__name__,
+                    "operation_count": len(request.operations) if isinstance(request, BatchRequest) else 1,
+                    "baseline_acknowledged_operations": 4,
+                    "probe_event": observed,
+                    "kill_timestamp_ns": kill_timestamp,
+                    "acknowledged": acknowledged,
+                    "recovery_verified": True,
+                    "oracle_verified": True,
+                }
+            )
+            report.passed.append(label)
+        except Exception as exc:
+            report.failed.append({"mode": label, "error": str(exc)})
+        finally:
+            if controller.is_ready():
+                controller.stop()
+
+
+def _run_large_value_crashes(executable: Path, probe_executable: Path, report: CampaignReport) -> None:
+    value = bytes(index % 251 for index in range(1 << 20))
+    for phase in ("STORAGE_APPEND_BEGIN", "STORAGE_SYNC_BEGIN"):
+        request = PutRequest(f"large-value-{phase}", b"large-value", value)
+        _run_gated_large_case(
+            executable,
+            probe_executable,
+            report,
+            f"large-value-crash-{phase.removeprefix('STORAGE_').removesuffix('_BEGIN').lower()}",
+            phase,
+            request,
+        )
+
+
+def _run_large_batch_crashes(executable: Path, probe_executable: Path, report: CampaignReport) -> None:
+    operations = []
+    for index in range(10_000):
+        key = f"large-batch-key-{index:05d}".encode()
+        if index % 3 == 0:
+            operations.append(DeleteRequest(f"large-batch-delete-{index}", key))
+        else:
+            operations.append(PutRequest(f"large-batch-put-{index}", key, f"value-{index}".encode()))
+    request = BatchRequest("large-batch-crash", tuple(operations))
+    for phase in ("STORAGE_APPEND_BEGIN", "STORAGE_SYNC_BEGIN"):
+        _run_gated_large_case(
+            executable,
+            probe_executable,
+            report,
+            f"large-batch-crash-{phase.removeprefix('STORAGE_').removesuffix('_BEGIN').lower()}",
+            phase,
+            request,
+        )
+
+
+def _run_close_crashes(executable: Path, probe_executable: Path, report: CampaignReport) -> None:
+    for phase in (
+        "STORAGE_CLOSE_ENTER",
+        "STORAGE_CLOSE_SYNC_BEGIN",
+        "STORAGE_CLOSE_FILE_CLOSE_BEGIN",
+        "STORAGE_CLOSE_EXIT",
+    ):
+        label = f"close-crash-{phase.removeprefix('STORAGE_CLOSE_').lower()}"
+        with tempfile.TemporaryDirectory(prefix=f"kvdb-{label}-") as raw:
+            directory = Path(raw)
+            database = directory / "database.kv"
+            oracle = Oracle()
+            seed = _adapter(executable, directory)
+            seed_controller = DatabaseController(seed)
+            seed_controller.start()
+            try:
+                for index in range(4):
+                    request = PutRequest(f"{label}-baseline-{index}", f"{label}-{index}".encode(), f"value-{index}".encode())
+                    response = seed.execute(request)
+                    if not isinstance(response, Acknowledgement):
+                        raise AssertionError("close baseline write was not acknowledged")
+                    oracle.apply_confirmed_write(request, response)
+                    report.acknowledged_writes += 1
+                    report.operations_attempted += 1
+            finally:
+                if seed_controller.is_ready():
+                    seed_controller.stop()
+
+            event_file = directory / "crashprobe.jsonl"
+            gate_file = directory / "release-gate"
+            adapter = _adapter(
+                probe_executable,
+                directory,
+                {
+                    "KVDB_CRASHPROBE_FILE": str(event_file),
+                    "KVDB_CRASHPROBE_GATE": str(gate_file),
+                    "KVDB_CRASHPROBE_GATE_EVENT": phase,
+                    "KVDB_CRASHPROBE_ALLOW_CLOSE": "1",
+                },
+            )
+            controller = DatabaseController(adapter)
+            result: dict[str, object] = {}
+            try:
+                controller.start()
+
+                def close_request() -> None:
+                    try:
+                        result["response"] = adapter.execute(CloseRequest(f"{label}-request"))
+                    except Exception as exc:
+                        result["error"] = exc
+
+                sender = threading.Thread(target=close_request, daemon=True)
+                sender.start()
+                deadline = time.monotonic() + 10.0
+                observed = None
+                while time.monotonic() < deadline:
+                    if event_file.exists():
+                        for line in event_file.read_text(encoding="utf-8").splitlines():
+                            try:
+                                event = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if event.get("event") == phase:
+                                observed = event
+                                break
+                    if observed is not None:
+                        break
+                    time.sleep(0.001)
+                if observed is None:
+                    raise AssertionError(f"{label}: close event was not observed")
+                controller.crash()
+                report.crashes += 1
+                sender.join(timeout=2.0)
+                controller.start()
+                report.restarts += 1
+                _check(executable, database)
+                _verify_permitted_states(adapter, [oracle])
+                report.storage_phase_kills += 1
+                report.crash_events.append({
+                    "kind": "close-crash",
+                    "phase": phase,
+                    "probe_event": observed,
+                    "baseline_acknowledged_operations": 4,
+                    "recovery_verified": True,
+                    "oracle_verified": True,
+                })
+                report.passed.append(label)
+            except Exception as exc:
+                report.failed.append({"mode": label, "error": str(exc)})
+            finally:
+                if controller.is_ready():
+                    controller.stop()
+
+
+def _history_record(item) -> dict[str, object]:
+    return {
+        "operation_id": item.operation_id,
+        "client_id": item.client_id,
+        "operation": item.operation,
+        "key": base64.b64encode(item.key).decode() if item.key is not None else None,
+        "value": base64.b64encode(item.value).decode() if item.value is not None else None,
+        "batch": [
+            {"operation": operation, "key": base64.b64encode(key).decode(), "value": base64.b64encode(value).decode() if value is not None else None}
+            for operation, key, value in item.batch
+        ],
+        "invoked_ns": item.invoked_ns,
+        "completed_ns": item.completed_ns,
+        "status": item.status,
+        "returned_value": base64.b64encode(item.returned_value).decode() if item.returned_value is not None else None,
+        "error": item.error,
+        "transaction_id": item.transaction_id,
+    }
+
+
+def _run_linearizability(executable: Path, seed: int, report: CampaignReport) -> None:
+    with tempfile.TemporaryDirectory(prefix="kvdb-linearizability-") as raw:
+        directory = Path(raw)
+        adapter = _adapter(executable, directory)
+        controller = DatabaseController(adapter)
+        controller.start()
+        try:
+            requests = [
+                ("writer-1", PutRequest(f"lin-{seed}-put-1", b"shared", b"one")),
+                ("reader-1", GetRequest(f"lin-{seed}-get-1", b"shared")),
+                ("writer-2", DeleteRequest(f"lin-{seed}-delete-1", b"shared")),
+                ("writer-1", BatchRequest(f"lin-{seed}-batch", (PutRequest("lin-b-a", b"batch-a", b"A"), DeleteRequest("lin-b-d", b"missing")))),
+                ("reader-1", GetRequest(f"lin-{seed}-get-2", b"batch-a")),
+                ("writer-2", PutRequest(f"lin-{seed}-put-2", b"shared", b"two")),
+                ("reader-1", GetRequest(f"lin-{seed}-get-3", b"shared")),
+            ]
+            history = []
+            history_lock = threading.Lock()
+
+            def execute(client_id: str, request) -> None:
+                invoked = time.monotonic_ns()
+                try:
+                    response = adapter.execute(request)
+                    completed = time.monotonic_ns()
+                    record = history_operation(
+                        request,
+                        response,
+                        client_id=client_id,
+                        invoked_ns=invoked,
+                        completed_ns=completed,
+                    )
+                    with history_lock:
+                        history.append(record)
+                except Exception as exc:
+                    completed = time.monotonic_ns()
+                    with history_lock:
+                        history.append(history_operation(
+                            request,
+                            ErrorResponse(request.request_id, str(exc)),
+                            client_id=client_id,
+                            invoked_ns=invoked,
+                            completed_ns=completed,
+                        ))
+
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                futures = [pool.submit(execute, client_id, request) for client_id, request in requests]
+                for future in futures:
+                    future.result()
+            result = check_history(history, max_states=100_000)
+            report.linearizability_results.append({
+                "result": result.result.value,
+                "history_size": result.history_size,
+                "explored_states": result.explored_states,
+                "search_budget": 100_000,
+                "linearization": result.linearization,
+                "history": [_history_record(item) for item in history],
+            })
+            if result.result is CheckResult.NOT_LINEARIZABLE:
+                report.failed.append({"mode": "linearizability", "error": result.reason})
+            elif result.result is CheckResult.INCONCLUSIVE:
+                report.not_tested.append(f"linearizability: {result.reason}")
+            else:
+                report.passed.append("linearizability")
+        finally:
+            if controller.is_ready():
+                controller.stop()
+
+
 def _verify_permitted_states(adapter, oracles: list[Oracle]) -> dict[bytes, bytes]:
     response = adapter.execute(DumpRequest(f"recovery-dump-{time.monotonic_ns()}"))
     if not hasattr(response, "entries"):
@@ -396,7 +878,10 @@ def _verify_permitted_states(adapter, oracles: list[Oracle]) -> dict[bytes, byte
 def _run_random_crash(executable: Path, seed: int, iterations: int, report: CampaignReport) -> None:
     """Run process-level crashes at seeded millisecond delays.
 
-    This is process-kill evidence only. It does not claim power-loss safety.
+    This is process-kill evidence only. Active-operation evidence describes the
+    parent harness interval around a request; it is not a claim that the Go
+    storage critical section was executing at the exact kill instruction.
+    It does not claim power-loss safety.
     """
     with tempfile.TemporaryDirectory(prefix="kvdb-random-crash-") as raw:
         directory = Path(raw)
@@ -404,6 +889,8 @@ def _run_random_crash(executable: Path, seed: int, iterations: int, report: Camp
         controller = DatabaseController(adapter)
         oracle = Oracle()
         rng = random.Random(seed ^ 0xC0DEC0DE)
+        active: dict[str, dict[str, object]] = {}
+        active_lock = threading.Lock()
         try:
             controller.start()
             requests = WorkloadGenerator(
@@ -417,10 +904,24 @@ def _run_random_crash(executable: Path, seed: int, iterations: int, report: Camp
             for iteration, request in enumerate(requests, start=1):
                 delay_ms = rng.randint(1, 20)
                 fired = threading.Event()
+                kill_evidence: dict[str, object] = {}
+                lifecycle = {
+                    "operation_id": request.request_id,
+                    "operation_type": type(request).__name__,
+                    "writer_id": "random-crash-writer-0",
+                    "invoked_ns": time.monotonic_ns(),
+                    "completed_ns": None,
+                    "acknowledged": False,
+                }
+                with active_lock:
+                    active[str(request.request_id)] = lifecycle
 
                 def crash_later() -> None:
                     time.sleep(delay_ms / 1000.0)
                     if controller.is_ready():
+                        kill_evidence["kill_ns"] = time.monotonic_ns()
+                        with active_lock:
+                            kill_evidence["active_operation_ids"] = list(active)
                         try:
                             controller.crash()
                             fired.set()
@@ -440,6 +941,10 @@ def _run_random_crash(executable: Path, seed: int, iterations: int, report: Camp
                 except AdapterAmbiguousError:
                     pass
                 finally:
+                    lifecycle["completed_ns"] = time.monotonic_ns()
+                    lifecycle["acknowledged"] = acknowledged
+                    with active_lock:
+                        active.pop(str(request.request_id), None)
                     killer.join(timeout=2.0)
 
                 if fired.is_set() or not controller.is_ready():
@@ -453,8 +958,20 @@ def _run_random_crash(executable: Path, seed: int, iterations: int, report: Camp
                     ):
                         permitted.append(_apply_to_copy(oracle, request))
                     report.crash_events.append(
-                        {"kind": "random-process", "delay_ms": delay_ms, "request_id": request.request_id}
+                        {
+                            "kind": "random-process",
+                            "delay_ms": delay_ms,
+                            "request_id": request.request_id,
+                            "kill_ns": kill_evidence.get("kill_ns"),
+                            "active_operation_ids": kill_evidence.get("active_operation_ids", []),
+                            "harness_active": bool(kill_evidence.get("active_operation_ids")),
+                        }
                     )
+                    report.operation_lifecycles.append(dict(lifecycle))
+                    if kill_evidence.get("active_operation_ids"):
+                        report.harness_active_kills += 1
+                    else:
+                        report.idle_kills += 1
                     recovered = _verify_permitted_states(adapter, permitted)
                     # An unacknowledged write may have committed before the
                     # process was killed.  Once the recovered snapshot has
@@ -467,6 +984,7 @@ def _run_random_crash(executable: Path, seed: int, iterations: int, report: Camp
                         flush=True,
                     )
                 else:
+                    report.operation_lifecycles.append(dict(lifecycle))
                     print(
                         f"iteration {iteration}/{iterations}: completed "
                         f"request={request.request_id} acknowledged={acknowledged}",
@@ -481,6 +999,108 @@ def _run_random_crash(executable: Path, seed: int, iterations: int, report: Camp
         finally:
             if controller.is_ready():
                 controller.stop()
+
+
+def _run_storage_phase_crashes(
+    executable: Path,
+    probe_executable: Path,
+    report: CampaignReport,
+) -> None:
+    """Kill a crash-probe child after an observed storage phase event."""
+    cases = (
+        ("append", "STORAGE_APPEND_BEGIN", PutRequest("probe-put", b"probe", b"value")),
+        ("sync", "STORAGE_SYNC_BEGIN", PutRequest("probe-sync", b"probe", b"value")),
+        (
+            "batch",
+            "STORAGE_APPEND_BEGIN",
+            BatchRequest(
+                "probe-batch",
+                (
+                    PutRequest("probe-batch-a", b"batch-a", b"one"),
+                    PutRequest("probe-batch-b", b"batch-b", b"two"),
+                ),
+            ),
+        ),
+    )
+    for label, wanted_event, request in cases:
+        with tempfile.TemporaryDirectory(prefix=f"kvdb-probe-{label}-") as raw:
+            directory = Path(raw)
+            event_file = directory / "crashprobe.jsonl"
+            gate_file = directory / "release-gate"
+            adapter = _adapter(
+                probe_executable,
+                directory,
+                {
+                    "KVDB_CRASHPROBE_FILE": str(event_file),
+                    "KVDB_CRASHPROBE_GATE": str(gate_file),
+                    "KVDB_CRASHPROBE_GATE_EVENT": wanted_event,
+                },
+            )
+            controller = DatabaseController(adapter)
+            oracle = Oracle()
+            result: dict[str, object] = {}
+            try:
+                controller.start()
+
+                def send() -> None:
+                    try:
+                        result["response"] = adapter.execute(request)
+                    except Exception as exc:  # process termination is expected
+                        result["error"] = exc
+
+                sender = threading.Thread(target=send, daemon=True)
+                sender.start()
+                deadline = time.monotonic() + 10.0
+                observed = None
+                while time.monotonic() < deadline:
+                    if event_file.exists():
+                        for line in event_file.read_text(encoding="utf-8").splitlines():
+                            try:
+                                event = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
+                            if (
+                                event.get("operation_id") == request.request_id
+                                and event.get("event") == wanted_event
+                            ):
+                                observed = event
+                                break
+                    if observed is not None:
+                        break
+                    time.sleep(0.001)
+                if observed is None:
+                    raise AssertionError(f"{label} probe event {wanted_event} was not observed")
+                controller.crash()
+                report.crashes += 1
+                sender.join(timeout=2.0)
+                controller.start()
+                report.restarts += 1
+                _check(executable, directory / "database.kv")
+                response = result.get("response")
+                acknowledged = isinstance(response, Acknowledgement)
+                if acknowledged:
+                    oracle.apply_confirmed_write(request, response)
+                permitted = [oracle]
+                if not acknowledged:
+                    permitted.append(_apply_to_copy(oracle, request))
+                _verify_permitted_states(adapter, permitted)
+                report.storage_phase_kills += 1
+                report.crash_events.append(
+                    {
+                        "kind": "storage-phase",
+                        "case": label,
+                        "event": wanted_event,
+                        "operation_id": request.request_id,
+                        "probe_event": observed,
+                        "acknowledged": acknowledged,
+                    }
+                )
+                report.passed.append(f"storage-{label}-crash")
+            except Exception as exc:
+                report.failed.append({"mode": f"storage-{label}-crash", "error": str(exc)})
+            finally:
+                if controller.is_ready():
+                    controller.stop()
 
 
 def _run_recovery_crashes(
@@ -767,6 +1387,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run real Go database torture modes")
     parser.add_argument("--executable", default=None)
     parser.add_argument("--fault-executable", default=None)
+    parser.add_argument("--crashprobe-executable", default=None)
     parser.add_argument(
         "--seed",
         type=int,
@@ -788,6 +1409,12 @@ def main() -> int:
             "large-batch",
             "concurrent-writers",
             "injected-enospc",
+            "storage-crash",
+            "concurrent-storage-crash",
+            "large-value-crash",
+            "large-batch-crash",
+            "close-crash",
+            "linearizability",
         ),
         default=[],
     )
@@ -814,6 +1441,8 @@ def main() -> int:
     executable = _executable(args.executable)
     fault_value = args.fault_executable or os.environ.get("KVDB_FAULT_EXECUTABLE")
     fault_executable = Path(fault_value).resolve() if fault_value else None
+    probe_value = args.crashprobe_executable or os.environ.get("KVDB_CRASHPROBE_EXECUTABLE")
+    probe_executable = Path(probe_value).resolve() if probe_value else None
     try:
         if not executable.exists():
             raise FileNotFoundError(executable)
@@ -847,6 +1476,33 @@ def main() -> int:
                         Path(injected).resolve(),
                         report,
                     )
+            elif mode == "storage-crash":
+                if probe_executable is None or not probe_executable.exists():
+                    report.not_tested.append("storage-crash: crash-probe executable is unavailable")
+                else:
+                    _run_storage_phase_crashes(executable, probe_executable, report)
+            elif mode == "concurrent-storage-crash":
+                if probe_executable is None or not probe_executable.exists():
+                    report.not_tested.append("concurrent-storage-crash: crash-probe executable is unavailable")
+                else:
+                    _run_concurrent_storage_crashes(executable, probe_executable, report)
+            elif mode == "large-value-crash":
+                if probe_executable is None or not probe_executable.exists():
+                    report.not_tested.append("large-value-crash: crash-probe executable is unavailable")
+                else:
+                    _run_large_value_crashes(executable, probe_executable, report)
+            elif mode == "large-batch-crash":
+                if probe_executable is None or not probe_executable.exists():
+                    report.not_tested.append("large-batch-crash: crash-probe executable is unavailable")
+                else:
+                    _run_large_batch_crashes(executable, probe_executable, report)
+            elif mode == "close-crash":
+                if probe_executable is None or not probe_executable.exists():
+                    report.not_tested.append("close-crash: crash-probe executable is unavailable")
+                else:
+                    _run_close_crashes(executable, probe_executable, report)
+            elif mode == "linearizability":
+                _run_linearizability(executable, args.seed, report)
     except (OSError, PermissionError) as exc:
         report.environment_blocked.append(str(exc))
     args.json_report.parent.mkdir(parents=True, exist_ok=True)

@@ -1,0 +1,38 @@
+{
+  "date": "2026-11-07",
+  "environment": {
+    "os": "WSL2 Linux 6.18.54.1-microsoft-standard-WSL2",
+    "cpu": "AMD Ryzen 7 7435HS",
+    "logical_cpus": 16,
+    "ram_visible": "7.7 GiB",
+    "go": "go1.26.8 linux/amd64",
+    "filesystem": "tmpfs"
+  },
+  "dataset": {
+    "keys": 1000000,
+    "total_value_bytes": 14000000,
+    "database_bytes": 34000060,
+    "checkpoint_bytes": 34000060,
+    "magic": "KVCPv003",
+    "checksum_sha256": "78f35e2f62e790a2c5a3dea427fa07ed5920c8f1a1ef14c0b61ad38716c81795",
+    "check": "OK"
+  },
+  "runs": [
+    {"run": 1, "recovery_ms": 2579, "heap_delta_bytes": 647325696},
+    {"run": 2, "recovery_ms": 2222, "heap_delta_bytes": 637244440},
+    {"run": 3, "recovery_ms": 2294, "heap_delta_bytes": 638580408},
+    {"run": 4, "recovery_ms": 2504, "heap_delta_bytes": 639080568},
+    {"run": 5, "recovery_ms": 2294, "heap_delta_bytes": 640203768}
+  ],
+  "statistics": {
+    "mean_ms": 2378.6,
+    "median_ms": 2294,
+    "min_ms": 2222,
+    "max_ms": 2579,
+    "population_stddev_ms": 137.6,
+    "under_two_seconds": false,
+    "cache_controlled": false,
+    "profiled_recovery_ms": 2611,
+    "profile_notes": "CPU profile pointed to hash/map reconstruction and allocation; loadCheckpoint was 41.64% cumulative."
+  }
+}
