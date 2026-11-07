@@ -114,7 +114,6 @@ class CampaignConstructionTests(unittest.TestCase):
         self.assertNotIn("recovery-crash mode", report.not_tested)
         self.assertNotIn("disk-full/ENOSPC mode", report.not_tested)
         self.assertIn("physical disk exhaustion", report.not_tested)
-        self.assertIn("linearizability checking", report.not_tested)
 
     def test_missing_executable_blocker_is_preserved(self):
         report = CampaignReport(

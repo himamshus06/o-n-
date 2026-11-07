@@ -30,7 +30,7 @@ func Open(path string, maxBytes int64) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
-	d := &DB{storage: s, values: map[string][]byte{}}
+	d := &DB{storage: s, values: make(map[string][]byte, len(recovered))}
 	for k, r := range recovered {
 		if r.Type == Put {
 			d.values[k] = append([]byte(nil), r.Value...)

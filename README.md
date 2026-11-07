@@ -399,10 +399,12 @@ For judge-style arguments, use the checked-in launcher from the repository
 root's `bin` directory:
 
 ```bash
-./bin/torture --iterations 500 --seed 12345
-./bin/torture --iterations 100 --seed 999 --mode large-values
-./bin/torture --iterations 100 --seed 7 --mode compaction
-./bin/torture --iterations 100 --seed 42 --mode recovery-crash
+KVDB_EXECUTABLE=./kvdb ./bin/torture --iterations 500 --seed 12345
+KVDB_EXECUTABLE=./kvdb ./bin/torture --iterations 100 --seed 999 --mode large-values
+KVDB_EXECUTABLE=./kvdb KVDB_FAULT_EXECUTABLE=./kvdb-fault \
+  ./bin/torture --iterations 100 --seed 7 --mode compaction
+KVDB_EXECUTABLE=./kvdb KVDB_FAULT_EXECUTABLE=./kvdb-fault \
+  ./bin/torture --iterations 100 --seed 42 --mode recovery-crash
 ```
 
 The launcher requires `--seed`, forwards the executable and fault-executable
@@ -421,19 +423,26 @@ the normal and fault-injection modes; the reports are written under `artifacts/`
 python3 -m venv .venv-wsl
 . .venv-wsl/bin/activate
 python -m pip install -r requirements-dev.txt
-go build -o kvdb ./src/cmd/kvdb
-go build -tags kvdb_faultinject -o kvdb-fault ./src/cmd/kvdb
-go build -tags kvdb_enospc -o kvdb-enospc ./src/cmd/kvdb
+./bin/build-tools.sh .go-tmp/bin
 go test ./...
-PYTHONPATH=torture KVDB_EXECUTABLE=./kvdb python -m pytest torture/tests -q
-./bin/torture --iterations 200 --seed 12345 --json-report artifacts/judge-200.json
-KVDB_FAULT_EXECUTABLE="$PWD/kvdb-fault" ./bin/torture \
+PYTHONPATH=torture KVDB_EXECUTABLE=./.go-tmp/bin/kvdb python -m pytest torture/tests -q
+KVDB_EXECUTABLE="$PWD/.go-tmp/bin/kvdb" ./bin/torture --iterations 200 --seed 12345 --json-report artifacts/judge-200.json
+KVDB_EXECUTABLE="$PWD/.go-tmp/bin/kvdb" KVDB_FAULT_EXECUTABLE="$PWD/.go-tmp/bin/kvdb-fault" ./bin/torture \
   --iterations 100 --seed 42 --mode recovery-crash \
   --json-report artifacts/judge-recovery.json
-KVDB_FAULT_EXECUTABLE="$PWD/kvdb-fault" ./bin/torture \
+KVDB_EXECUTABLE="$PWD/.go-tmp/bin/kvdb" KVDB_FAULT_EXECUTABLE="$PWD/.go-tmp/bin/kvdb-fault" ./bin/torture \
   --iterations 100 --seed 7 --mode compaction \
   --json-report artifacts/judge-compaction.json
 ```
+
+`bin/build-tools.sh` is the reproducible special-build setup. It creates
+disposable outputs under `.go-tmp/bin`: the normal executable, recovery and
+compaction fault hooks, injected ENOSPC, storage crash-probe, and sync-failure
+test executables. Normal `go build` has none of these build tags enabled.
+Use `./bin/torture --help` to see the supported modes and required seed. The
+repository deliberately keeps `torture/` as the Python package, so the
+judge-facing Linux/WSL launcher is `./bin/torture`, not a root-level
+`./torture` file.
 
 The campaign exits `0` only when no campaign failure is recorded. Each run
 prints its final JSON report and writes a Markdown report beside the requested
@@ -445,6 +454,66 @@ compaction modes use the separately built fault-injection executable.
 Crash, recovery-interruption, compaction-interruption, and deterministic
 injected-ENOSPC modes are separate real-binary modes. They remain distinct from
 simulator-only faults and from physical disk exhaustion.
+
+For storage-level phase evidence, build the opt-in crash-probe executable:
+
+```bash
+go build -tags kvdb_crashprobe -o kvdb-crashprobe ./src/cmd/kvdb
+KVDB_CRASHPROBE_EXECUTABLE="$PWD/kvdb-crashprobe" \
+PYTHONPATH=torture python -m campaign \
+  --executable ./kvdb \
+  --crashprobe-executable ./kvdb-crashprobe \
+  --seed 123 --mode storage-crash \
+  --json-report artifacts/storage-crash.json
+```
+
+The probe emits JSONL lifecycle events to a disposable file selected by the
+harness, never to protocol stdout or the database file. The controlled mode
+gates at observed append or sync entry events before terminating the child,
+then reopens, checks, dumps, and compares against the independent oracle. These
+events prove that the child reached the named storage phase; they do not prove
+the exact CPU instruction executing when the OS terminates the process.
+
+Close-time crash probing is available with the same opt-in build:
+
+```bash
+KVDB_CRASHPROBE_EXECUTABLE="$PWD/kvdb-crashprobe" \
+PYTHONPATH=torture python -m campaign \
+  --executable ./kvdb \
+  --crashprobe-executable ./kvdb-crashprobe \
+  --seed 2026 --mode close-crash \
+  --json-report artifacts/close-crash.json
+```
+
+`DB.Close` takes the DB write lock, marks the DB closed, then
+`storage.close` calls `File.Sync` when storage is not poisoned, closes the file,
+and propagates synchronization or close errors. Repeated `Close` calls are
+safe and return nil after the DB is marked closed. The probe-only `CLOSE`
+request is rejected by normal builds; it exists only to gate and terminate a
+crash-probe subprocess. This tests process termination during close, not power
+loss.
+
+### Bounded linearizability checking
+
+The normal-execution checker records overlapping PUT, GET, DELETE, and BATCH
+calls from multiple clients and searches for a sequential explanation that
+respects completed-before-invoked real-time ordering. Batches are modeled as
+atomic operations. Run it against the freshly built executable with a required
+seed:
+
+```bash
+PYTHONPATH=torture python -m campaign \
+  --executable ./kvdb \
+  --seed 2026 \
+  --mode linearizability \
+  --json-report artifacts/linearizability.json
+```
+
+The JSON and Markdown reports include the recorded history and the checker
+result. `LINEARIZABLE` means the bounded history has a valid explanation;
+`NOT_LINEARIZABLE` is a failure; `INCONCLUSIVE` means the configured search
+budget was exhausted and is not a pass. This is a bounded history check, not a
+formal proof of all executions, and it is separate from crash campaigns.
 
 ### WSL Ubuntu validation
 
@@ -490,6 +559,27 @@ This Python regression suite is distinct from the randomized
 crash-torture runner described by the project requirements. Passing the
 regression suite does not establish that the full randomized torture
 campaign has completed.
+
+### Bounded physical ENOSPC experiment (WSL2 only)
+
+The optional `torture/physical-enospc.sh` harness creates a unique 128 MiB
+ext4 image, mounts it at a unique temporary directory, keeps the database and
+filler files inside that filesystem, and removes the mount and image on exit.
+It refuses to run without passwordless `sudo`, on a non-empty target, or with
+an executable missing. It is not part of ordinary tests and must never point at
+the project database:
+
+```bash
+go build -o kvdb ./src/cmd/kvdb
+KVDB_EXECUTABLE="$PWD/kvdb" bash torture/physical-enospc.sh \
+  artifacts/physical-enospc.json
+```
+
+The helper reports the filesystem, free space, exact PUT/BATCH responses,
+recovery check, and post-recovery write. A successful run is labeled
+`PHYSICAL_ENOSPC`; injected failures from `--mode injected-enospc` remain a
+separate result. If WSL lacks noninteractive mount privileges, the physical
+experiment is `NOT_TESTED` rather than falling back to the host filesystem.
 
 The Go module files (`go.mod` and, if present, `go.sum`) define the
 project's external dependency requirements. For an offline build, all
@@ -782,6 +872,23 @@ valid backup is available and the authoritative path is missing, a valid
 is not accepted as a replacement. The candidate-validation and selection
 logic is implemented in `openStorage()` and `validStorageCandidate()` in
 `src/kvdb/storage.go`.
+
+### Recovery performance evidence
+
+The current recovery path uses a bounded checkpoint entry-count hint only to
+preallocate the recovered index, and preallocates the DB's committed value map
+from the recovered count. The hint is never used as validation; the complete
+checkpoint parser still performs all checksum, bounds, ordering, marker, and
+transaction checks, and legacy files still use legacy recovery.
+
+A fresh WSL2 benchmark on 2026-11-07 recovered 1,000,000 keys in five fresh
+processes in 1,484, 1,162, 1,149, 1,121, and 1,207 ms (mean 1,224.6 ms;
+median 1,162 ms). Every run returned the same checksum
+`78f35e2f62e790a2c5a3dea427fa07ed5920c8f1a1ef14c0b61ad38716c81795`; CHECK
+returned `OK` and the file was 34,000,060 bytes. The environment was WSL2 on
+an AMD Ryzen 7 7435HS with 16 logical CPUs, 7.7 GiB visible RAM, Go 1.26.8,
+and `tmpfs`; cache state was not controlled. These are measured,
+environment-specific results, not a universal recovery-time guarantee.
 
 ## Compaction and platform notes
 

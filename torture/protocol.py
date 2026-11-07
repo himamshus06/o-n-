@@ -26,6 +26,7 @@ class Operation(str, Enum):
     BATCH = "BATCH"
     DUMP = "DUMP"
     COMPACT = "COMPACT"
+    CLOSE = "CLOSE"
 
 
 class Durability(str, Enum):
@@ -154,7 +155,21 @@ class CompactRequest:
         return {"id": self.request_id, "op": "COMPACT"}
 
 
-Request: TypeAlias = PutRequest | GetRequest | DeleteRequest | BatchRequest | DumpRequest | CompactRequest
+@dataclass(frozen=True, slots=True)
+class CloseRequest:
+    """Crash-probe-only close control; normal servers reject it."""
+
+    request_id: RequestId
+    operation: Operation = Operation.CLOSE
+
+    def __post_init__(self) -> None:
+        validate_request_id(self.request_id)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.request_id, "op": "CLOSE"}
+
+
+Request: TypeAlias = PutRequest | GetRequest | DeleteRequest | BatchRequest | DumpRequest | CompactRequest | CloseRequest
 
 
 @dataclass(frozen=True, slots=True)

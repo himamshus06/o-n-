@@ -198,6 +198,15 @@ func serve(a []string) {
 		}
 		op := strings.ToUpper(req.Op)
 		switch op {
+		case "CLOSE":
+			if !kvdb.CrashProbeCloseRequestEnabled() {
+				writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: "Invalid operation"})
+				continue
+			}
+			if err := db.Close(); err != nil {
+				writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: err.Error()})
+			}
+			return
 		case "COMPACT":
 			if err := db.Compact(); err != nil {
 				if !writeServeError(out, req.ID, err, db.RecoveryRequired()) {
@@ -236,19 +245,25 @@ func serve(a []string) {
 					continue
 				}
 				value, _ := base64.StdEncoding.DecodeString(*req.Value)
+				kvdb.CrashProbeSetOperation(crashProbeRequestID(req.ID), op)
 				if err := db.Put(key, value); err != nil {
+					kvdb.CrashProbeClearOperation()
 					if !writeServeError(out, req.ID, err, db.RecoveryRequired()) {
 						return
 					}
 				} else {
+					kvdb.CrashProbeClearOperation()
 					writeServeResponse(out, serveResponse{ID: req.ID, Status: "ACK"})
 				}
 			} else {
+				kvdb.CrashProbeSetOperation(crashProbeRequestID(req.ID), op)
 				if err := db.Delete(key); err != nil {
+					kvdb.CrashProbeClearOperation()
 					if !writeServeError(out, req.ID, err, db.RecoveryRequired()) {
 						return
 					}
 				} else {
+					kvdb.CrashProbeClearOperation()
 					writeServeResponse(out, serveResponse{ID: req.ID, Status: "ACK"})
 				}
 			}
@@ -258,11 +273,14 @@ func serve(a []string) {
 				writeServeResponse(out, serveResponse{ID: req.ID, Status: "ERROR", Error: err.Error()})
 				continue
 			}
+			kvdb.CrashProbeSetOperation(crashProbeRequestID(req.ID), op)
 			if err = db.Batch(ops); err != nil {
+				kvdb.CrashProbeClearOperation()
 				if !writeServeError(out, req.ID, err, db.RecoveryRequired()) {
 					return
 				}
 			} else {
+				kvdb.CrashProbeClearOperation()
 				writeServeResponse(out, serveResponse{ID: req.ID, Status: "ACK"})
 			}
 		case "DUMP":
@@ -310,6 +328,19 @@ func writeServeResponse(w *bufio.Writer, response serveResponse) {
 	b, _ := json.Marshal(response)
 	_, _ = w.Write(append(b, '\n'))
 	_ = w.Flush()
+}
+
+func crashProbeRequestID(raw json.RawMessage) string {
+	var value any
+	if json.Unmarshal(raw, &value) == nil {
+		switch v := value.(type) {
+		case string:
+			return v
+		case float64:
+			return strconv.FormatInt(int64(v), 10)
+		}
+	}
+	return string(raw)
 }
 func writeServeError(w *bufio.Writer, id json.RawMessage, err error, recoveryRequired bool) bool {
 	if recoveryRequired || err == kvdb.ErrRecoveryRequired || dbRecoveryError(err) {
