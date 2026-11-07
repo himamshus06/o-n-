@@ -65,6 +65,14 @@ The three guarantees are bounded: **Durability**—success is returned after the
 
 The DB `RWMutex` protects the committed map, lifecycle, and batch visibility. GET uses a read lock and returns copied bytes. Batch and compaction use the write lock. `storage.mu` serializes file operations. This is a thread-safety design for one DB instance; the implementation does not provide inter-process locking, and race-detector success is not a history-based linearizability proof.
 
+The torture suite's `linearizability` mode records a bounded real-process
+history from concurrent clients and uses `torture/linearizability.py` to search
+for a sequential explanation respecting completed-before-invoked ordering.
+PUT, GET, DELETE, and atomic BATCH are modeled independently of the database.
+The result is `LINEARIZABLE`, `NOT_LINEARIZABLE`, or `INCONCLUSIVE` when the
+search budget is exhausted; this is a bounded executable check, not a proof of
+all possible histories and not a crash-campaign result.
+
 Before append, `storage.commit` serializes the entire transaction and rejects a configured `maxBytes` overflow without writing it. Physical ENOSPC can still occur during append or sync. Append errors attempt rollback; rollback/sync uncertainty poisons storage and requires recovery. The implementation has injected ENOSPC and rollback tests plus a historical isolated WSL2 ENOSPC experiment, but not every physical-disk failure boundary.
 
 ## F. CLI and JSONL protocol
@@ -85,6 +93,8 @@ Serve prints `READY` on stderr, reads one JSON request per line, and writes only
 ## G. Performance and evidence
 
 The one-million-key checkpoint benchmark recovered exactly 1,000,000 keys with matching checksum; measured runs were 1,854, 1,955, 1,876, 1,874, and 1,931 ms (mean about 1,898 ms), with a large allocation profile of about 937 MB. The under-two-second target was met by that reported benchmark, but hardware and workload-specific performance remain relevant. `go test -race ./...` passed in the supplied CGO-enabled WSL2 run; this does not prove linearizability. Python regression and targeted crash campaigns were run, including actual child kills/restarts in the reported random campaign, but the official 500-kill campaign and physical disk-exhaustion torture mode remain unverified.
+
+The current implementation also preallocates the recovered checkpoint map from a bounded entry-count hint and preallocates the DB's committed value map from the recovered count. The hint is only an allocation optimization: `loadCheckpoint` remains the authority for header, CRC32C, payload, frame, completion-marker, bounds, ordering, and transaction validation; key and value bytes remain copied into owned memory. A fresh five-run benchmark on 2026-11-07 measured 1,484, 1,162, 1,149, 1,121, and 1,207 ms (mean 1,224.6 ms; median 1,162 ms) for exactly 1,000,000 keys, with checksum `78f35e2f62e790a2c5a3dea427fa07ed5920c8f1a1ef14c0b61ad38716c81795` and CHECK `OK`. It ran under WSL2 on an AMD Ryzen 7 7435HS with 16 logical CPUs, 7.7 GiB visible RAM, Go 1.26.8, and `tmpfs`; cache state was not controlled. This is measured, environment-specific evidence, not a universal performance guarantee.
 
 ## H. Official A1–F4 proof matrix
 
