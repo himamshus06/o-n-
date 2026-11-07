@@ -43,6 +43,20 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ProtocolValidationError):
             decode_base64(base64.b64encode(b"v" * (MAX_VALUE_SIZE + 1)).decode(), field="value", max_size=MAX_VALUE_SIZE)
 
+    def test_key_requires_at_least_one_byte(self):
+        for request in (
+            PutRequest,
+            GetRequest,
+            DeleteRequest,
+        ):
+            with self.subTest(request=request.__name__), self.assertRaises(ProtocolValidationError):
+                if request is PutRequest:
+                    request("empty", b"", b"value")
+                else:
+                    request("empty", b"")
+        self.assertEqual(len(PutRequest("one", b"k", b"").key), 1)
+        self.assertEqual(len(GetRequest("max", b"k" * MAX_KEY_SIZE).key), MAX_KEY_SIZE)
+
     def test_string_integer_and_boolean_ids(self):
         self.assertEqual(request_from_dict({"id": "x", "op": "DUMP"}).request_id, "x")
         self.assertEqual(request_from_dict({"id": 7, "op": "DUMP"}).request_id, 7)

@@ -29,6 +29,12 @@ func TestServeValidation(t *testing.T) {
 	if err := validateEncodedKey("not-base64"); err == nil {
 		t.Fatal("accepted invalid key")
 	}
+	if err := validateEncodedKey(""); err == nil {
+		t.Fatal("accepted empty decoded key")
+	}
+	if err := validateEncodedKey(base64.StdEncoding.EncodeToString(make([]byte, 1024))); err != nil {
+		t.Fatalf("rejected 1024-byte key: %v", err)
+	}
 	key := base64.StdEncoding.EncodeToString([]byte("a"))
 	value := base64.StdEncoding.EncodeToString([]byte("1"))
 	if ops, err := decodeBatch([]serveBatchOperation{{Op: "PUT", Key: key, Value: &value}, {Op: "DELETE", Key: key}}); err != nil || len(ops) != 2 {
@@ -40,6 +46,9 @@ func TestServeValidation(t *testing.T) {
 	}
 	if _, err := decodeBatch([]serveBatchOperation{{Op: "PUT", Key: key}}); err == nil {
 		t.Fatal("accepted batch PUT with missing value")
+	}
+	if _, err := decodeBatch([]serveBatchOperation{{Op: "PUT", Key: "", Value: &value}}); err == nil {
+		t.Fatal("accepted batch PUT with empty key")
 	}
 }
 
@@ -114,6 +123,18 @@ func TestServeEmptyValuesSurviveRestart(t *testing.T) {
 		t.Fatal(got)
 	}
 	if got := request(in, out, `{"id":11,"op":"BATCH","operations":[{"op":"PUT","key":"Zg=="}]}`); !strings.Contains(got, `"status":"ERROR"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":16,"op":"PUT","key":"","value":"MQ=="}`); !strings.Contains(got, `"status":"ERROR"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":17,"op":"GET","key":""}`); !strings.Contains(got, `"status":"ERROR"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":18,"op":"DELETE","key":""}`); !strings.Contains(got, `"status":"ERROR"`) {
+		t.Fatal(got)
+	}
+	if got := request(in, out, `{"id":19,"op":"BATCH","operations":[{"op":"PUT","key":"","value":"MQ=="}]}`); !strings.Contains(got, `"status":"ERROR"`) {
 		t.Fatal(got)
 	}
 	_ = in.Close()

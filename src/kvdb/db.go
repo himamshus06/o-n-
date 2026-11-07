@@ -46,6 +46,12 @@ func (db *DB) Get(k []byte) ([]byte, error) {
 	if db.closed {
 		return nil, ErrClosed
 	}
+	if len(k) == 0 {
+		return nil, &limitError{"key must contain between 1 and 1024 bytes"}
+	}
+	if len(k) > 1024 {
+		return nil, &limitError{"key exceeds 1024 bytes"}
+	}
 	v, ok := db.values[string(k)]
 	if !ok {
 		return nil, ErrNotFound
@@ -65,6 +71,9 @@ func (db *DB) Batch(ops []Operation) error {
 		return ErrRecoveryRequired
 	}
 	for _, op := range ops {
+		if len(op.Key) == 0 {
+			return &limitError{"key must contain between 1 and 1024 bytes"}
+		}
 		if len(op.Key) > 1024 {
 			return &limitError{"key exceeds 1024 bytes"}
 		}
