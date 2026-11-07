@@ -4,6 +4,7 @@ This document describes the implementation in `src/kvdb` and `src/cmd/kvdb`, not
 
 ## A. Runtime architecture and ordering
 
+![high level Architecture](diag.jpeg)
 ![Runtime Architecture](architecture.svg)
 
 For a write, `DB.Batch` validates all operations, then `storage.commit` serializes the complete group, checks `maxBytes`, writes operation frames, writes one commit frame, and calls `File.Sync`. Only after that returns does `DB.Batch` apply the operations to the in-memory map. The serve loop writes an ACK/success response only after the DB method returns. A failed append attempts truncate, seek, and sync; a sync failure poisons storage even if rollback appears to succeed, so later writes return recovery-required/UNKNOWN rather than pretending the outcome is known.
