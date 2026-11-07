@@ -5,6 +5,318 @@ database written in Go. It stores data in a single authoritative
 database file and exposes a command-line interface and a JSON Lines
 server protocol.
 
+## Simple step-by-step demo
+
+This is the easiest way to try the project from a fresh WSL Ubuntu
+installation. The commands below use a temporary sample database, so they do
+not touch an important database on your computer.
+
+### Step 1: Open WSL and install the tools
+
+Open **Ubuntu** from the Windows Start menu. Then type:
+
+```bash
+sudo apt update
+sudo apt install -y git golang python3 python3-venv build-essential
+```
+
+Check that the tools are ready:
+
+```bash
+go version
+python3 --version
+git --version
+```
+
+### Step 2: Download the project
+
+Clone the project and enter its folder:
+
+```bash
+cd /mnt/d
+git clone https://github.com/himamshus06/o-n-.git killitandproveit
+cd killitandproveit
+```
+
+If you already downloaded the project, use its real folder instead. You must
+be in the folder that contains `go.mod`. Check with:
+
+```bash
+ls go.mod src/cmd/kvdb
+```
+
+If this command says a file is missing, stop and change to the correct project
+folder. Do not run `go mod init` for this project.
+
+### Step 3: Build the database programs
+
+Build the normal program and the two special test programs:
+
+```bash
+go build -o kvdb ./src/cmd/kvdb
+go build -tags kvdb_faultinject -o kvdb-fault ./src/cmd/kvdb
+go build -tags kvdb_enospc -o kvdb-enospc ./src/cmd/kvdb
+```
+
+You should now have these files:
+
+```bash
+ls -l kvdb kvdb-fault kvdb-enospc
+```
+
+`kvdb` is the normal database. `kvdb-fault` is used to stop the database at
+planned recovery or compaction points. `kvdb-enospc` simulates a disk-full
+error in a controlled test. It is not a real full hard drive test.
+
+### Step 4: Make a Python environment
+
+```bash
+python3 -m venv .venv-wsl
+. .venv-wsl/bin/activate
+python3 -m pip install --upgrade pip pytest
+```
+
+The `.venv-wsl` folder is only a local Python environment for this project.
+
+### Step 5: Run the tests
+
+Run the Go tests:
+
+```bash
+go test -count=1 ./...
+```
+
+Run the Python framework tests:
+
+```bash
+PYTHONPATH=torture python3 -m unittest discover tests -v
+PYTHONPATH=torture python3 -m unittest discover torture/tests -v
+```
+
+The command must finish without a `FAIL` line. If it fails, save the error
+text; do not call the test a pass.
+
+### Step 6: Try a small sample database
+
+Create a temporary folder and a small batch file:
+
+```bash
+DEMO_DIR="$(mktemp -d /tmp/kvdb-demo-XXXXXX)"
+DB="$DEMO_DIR/demo.kv"
+BATCH_FILE="$DEMO_DIR/batch.txt"
+
+printf 'PUT beta two\nPUT alpha one\nDELETE missing\n' > "$BATCH_FILE"
+```
+
+Run normal database commands:
+
+```bash
+./kvdb open "$DB"
+./kvdb put "$DB" greeting hello
+./kvdb get "$DB" greeting
+./kvdb del "$DB" greeting
+./kvdb get "$DB" greeting
+./kvdb batch "$DB" "$BATCH_FILE"
+./kvdb dump "$DB"
+./kvdb check "$DB"
+```
+
+You should see:
+
+- `hello` after the first `get`;
+- `NOTFOUND` after deleting `greeting`;
+- `alpha one` and `beta two` in the dump;
+- `OK` from `check`.
+
+Now reopen the same file:
+
+```bash
+./kvdb open "$DB"
+./kvdb dump "$DB"
+```
+
+The `alpha` and `beta` data should still be there. This shows that committed
+data survives a separate process run.
+
+Keep this temporary folder until after the JSON Lines example below. It is
+safe because it was created by `mktemp`.
+
+### Step 7: Try the JSON Lines server
+
+The database can also run as a server. The server reads **one JSON object per
+line** and writes **one JSON response per line**. Keys and values must be
+Base64 text.
+
+For example:
+
+| What you want | JSON Lines request |
+| --- | --- |
+| Save `hello` as `world` | `{"id":1,"op":"PUT","key":"aGVsbG8=","value":"d29ybGQ="}` |
+| Read `hello` | `{"id":2,"op":"GET","key":"aGVsbG8="}` |
+| Delete `hello` | `{"id":3,"op":"DELETE","key":"aGVsbG8="}` |
+| Show all data | `{"id":4,"op":"DUMP"}` |
+| Compact the database | `{"id":5,"op":"COMPACT"}` |
+
+`aGVsbG8=` is Base64 for `hello`. `d29ybGQ=` is Base64 for `world`.
+
+Use the same temporary database from the previous step:
+
+```bash
+cat > "$DEMO_DIR/requests.jsonl" <<'JSONL'
+{"id":1,"op":"PUT","key":"aGVsbG8=","value":"d29ybGQ="}
+{"id":2,"op":"GET","key":"aGVsbG8="}
+{"id":3,"op":"DELETE","key":"aGVsbG8="}
+{"id":4,"op":"DUMP"}
+JSONL
+
+./kvdb serve "$DB" \
+  < "$DEMO_DIR/requests.jsonl" \
+  > "$DEMO_DIR/responses.jsonl" \
+  2> "$DEMO_DIR/server.log"
+
+cat "$DEMO_DIR/responses.jsonl"
+cat "$DEMO_DIR/server.log"
+```
+
+The response file should contain an `ACK` for the `PUT`, a `VALUE` response
+for the `GET`, an `ACK` for the `DELETE`, and a `DUMP` response. The `READY`
+message and other diagnostics are written to `server.log`, not to the JSON
+response file.
+
+A JSON Lines batch is one request containing several operations. For example:
+
+```bash
+cat > "$DEMO_DIR/batch-request.jsonl" <<'JSONL'
+{"id":10,"op":"BATCH","operations":[{"op":"PUT","key":"YWxwaGE=","value":"b25l"},{"op":"PUT","key":"YmV0YQ==","value":"dHdv"},{"op":"DELETE","key":"bm90LWZvdW5k"}]}
+{"id":11,"op":"DUMP"}
+JSONL
+
+./kvdb serve "$DB" \
+  < "$DEMO_DIR/batch-request.jsonl" \
+  > "$DEMO_DIR/batch-responses.jsonl" \
+  2> "$DEMO_DIR/batch-server.log"
+
+cat "$DEMO_DIR/batch-responses.jsonl"
+```
+
+The batch should return one `ACK`. The `DUMP` should show `alpha` with value
+`one` and `beta` with value `two`. A batch is all-or-nothing: after an error,
+do not assume that any part of it was saved until you reopen the database and
+inspect it with `DUMP` and `check`.
+
+When finished with the complete sample, remove its temporary folder:
+
+```bash
+rm -rf "$DEMO_DIR"
+```
+
+This removes only the folder created by `mktemp`; it does not remove the
+project or the compiled programs.
+
+### Step 8: Run the real-binary campaigns
+
+Every command below uses the compiled Go database, not a simulator. Each
+command writes a JSON report and a Markdown report. The seed makes the random
+workload repeatable.
+
+Run the normal 500-operation workload:
+
+```bash
+PYTHONPATH=torture python3 -m campaign \
+  --executable ./kvdb \
+  --seed 424242 \
+  --iterations 500 \
+  --mode default \
+  --json-report artifacts/demo-default.json
+```
+
+Run concurrent writers, a 1 MiB value, and a 10,000-operation batch:
+
+```bash
+PYTHONPATH=torture python3 -m campaign \
+  --executable ./kvdb \
+  --seed 424242 \
+  --iterations 500 \
+  --mode concurrent-writers \
+  --mode large-value \
+  --mode large-batch \
+  --json-report artifacts/demo-boundaries.json
+```
+
+Run process crashes and recovery:
+
+```bash
+PYTHONPATH=torture python3 -m campaign \
+  --executable ./kvdb \
+  --seed 424242 \
+  --iterations 500 \
+  --mode random-crash \
+  --json-report artifacts/demo-random-crash.json
+
+PYTHONPATH=torture python3 -m campaign \
+  --executable ./kvdb \
+  --fault-executable ./kvdb-fault \
+  --seed 424242 \
+  --iterations 500 \
+  --mode recovery-crash \
+  --mode compaction-crash \
+  --json-report artifacts/demo-recovery-compaction.json
+```
+
+Run deterministic injected ENOSPC tests:
+
+```bash
+KVDB_ENOSPC_EXECUTABLE="$PWD/kvdb-enospc" \
+PYTHONPATH=torture python3 -m campaign \
+  --executable ./kvdb \
+  --seed 424242 \
+  --iterations 500 \
+  --mode injected-enospc \
+  --json-report artifacts/demo-enospc.json
+```
+
+### Step 9: Read and verify the reports
+
+For every campaign, replace the filename below with the report you want to
+inspect:
+
+```bash
+cat artifacts/demo-default.json
+cat artifacts/demo-default.md
+```
+
+A successful report has an empty `failed` list and zero values for recovery
+failures and oracle mismatches. It also shows the passed test cases. The
+Markdown report contains the same finalized report information as the JSON
+report.
+
+The report should keep these limitations under `not_tested`:
+
+- `physical disk exhaustion`
+- `linearizability checking`
+
+The injected ENOSPC campaign is a controlled simulation. It must not be
+described as proof of physical disk exhaustion. The random-crash campaign also
+does not prove that every crash interrupted an in-flight request.
+
+### Step 10: Repeat a seeded run
+
+Run the same default campaign twice with different report names:
+
+```bash
+PYTHONPATH=torture python3 -m campaign \
+  --executable ./kvdb --seed 424242 --iterations 500 --mode default \
+  --json-report artifacts/repro-1.json
+
+PYTHONPATH=torture python3 -m campaign \
+  --executable ./kvdb --seed 424242 --iterations 500 --mode default \
+  --json-report artifacts/repro-2.json
+```
+
+The meaningful fields should match. Start time, finish time, and duration may
+be different. The two Markdown files are `artifacts/repro-1.md` and
+`artifacts/repro-2.md`.
+
 ## Build and test
 
 ### Requirements
