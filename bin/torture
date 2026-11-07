@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
+cd "$repo_root"
+export PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}torture"
+
+args=(--executable "${KVDB_EXECUTABLE:-./kvdb}")
+if [[ -n "${KVDB_FAULT_EXECUTABLE:-}" ]]; then
+  args+=(--fault-executable "$KVDB_FAULT_EXECUTABLE")
+fi
+
+exec python3 -m campaign "${args[@]}" "$@"

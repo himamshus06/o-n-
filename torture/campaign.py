@@ -414,7 +414,7 @@ def _run_random_crash(executable: Path, seed: int, iterations: int, report: Camp
                     max_batch_size=8,
                 )
             ).generate()
-            for request in requests:
+            for iteration, request in enumerate(requests, start=1):
                 delay_ms = rng.randint(1, 20)
                 fired = threading.Event()
 
@@ -461,6 +461,17 @@ def _run_random_crash(executable: Path, seed: int, iterations: int, report: Camp
                     # been validated against the permitted states, use it as
                     # the baseline for subsequent requests.
                     oracle._data = recovered
+                    print(
+                        f"iteration {iteration}/{iterations}: crash/restart "
+                        f"request={request.request_id} acknowledged={acknowledged}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"iteration {iteration}/{iterations}: completed "
+                        f"request={request.request_id} acknowledged={acknowledged}",
+                        flush=True,
+                    )
             _check(executable, directory / "database.kv")
             _verify_permitted_states(adapter, [oracle])
             report.passed.append("random-process-crashes")
@@ -756,17 +767,38 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Run real Go database torture modes")
     parser.add_argument("--executable", default=None)
     parser.add_argument("--fault-executable", default=None)
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument(
+        "--seed",
+        type=int,
+        required=True,
+        help="mandatory deterministic seed",
+    )
     parser.add_argument("--iterations", type=int, default=500)
     parser.add_argument(
         "--mode",
         action="append",
-        choices=("default", "random-crash", "recovery-crash", "compaction-crash", "large-value", "large-batch", "concurrent-writers", "injected-enospc"),
+        choices=(
+            "default",
+            "random-crash",
+            "recovery-crash",
+            "compaction-crash",
+            "compaction",
+            "large-value",
+            "large-values",
+            "large-batch",
+            "concurrent-writers",
+            "injected-enospc",
+        ),
         default=[],
     )
     parser.add_argument("--json-report", type=Path, default=Path("artifacts/campaign.json"))
     args = parser.parse_args()
-    modes = args.mode or ["default"]
+    aliases = {
+        "large-values": "large-value",
+        "compaction": "compaction-crash",
+    }
+    requested_modes = args.mode or ["random-crash", "concurrent-writers"]
+    modes = [aliases.get(mode, mode) for mode in requested_modes]
     report = CampaignReport(
         started_utc=datetime.now(timezone.utc).isoformat(),
         seed=args.seed,

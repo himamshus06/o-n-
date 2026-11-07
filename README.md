@@ -83,6 +83,53 @@ python -m campaign --seed 424242 --iterations 500 --mode default
 python -m campaign --seed 424242 --mode large-value --mode large-batch --mode concurrent-writers
 ```
 
+For judge-style arguments, use the checked-in launcher from the repository
+root's `bin` directory:
+
+```bash
+./bin/torture --iterations 500 --seed 12345
+./bin/torture --iterations 100 --seed 999 --mode large-values
+./bin/torture --iterations 100 --seed 7 --mode compaction
+./bin/torture --iterations 100 --seed 42 --mode recovery-crash
+```
+
+The launcher requires `--seed`, forwards the executable and fault-executable
+environment settings, and maps the judge aliases `large-values` and
+`compaction` to the implemented modes. The repository already contains a
+directory named `torture`, so a root-level file named `./torture` cannot coexist
+with it on normal filesystems; `./bin/torture` is the equivalent executable
+entry point. The no-mode launcher run executes the seeded random-crash and
+concurrent-writer modes.
+
+To reproduce a clean seeded run from a fresh WSL checkout, run the following
+from the repository root. The build commands create all executables required by
+the normal and fault-injection modes; the reports are written under `artifacts/`.
+
+```bash
+python3 -m venv .venv-wsl
+. .venv-wsl/bin/activate
+python -m pip install -r requirements-dev.txt
+go build -o kvdb ./src/cmd/kvdb
+go build -tags kvdb_faultinject -o kvdb-fault ./src/cmd/kvdb
+go build -tags kvdb_enospc -o kvdb-enospc ./src/cmd/kvdb
+go test ./...
+PYTHONPATH=torture KVDB_EXECUTABLE=./kvdb python -m pytest torture/tests -q
+./bin/torture --iterations 200 --seed 12345 --json-report artifacts/judge-200.json
+KVDB_FAULT_EXECUTABLE="$PWD/kvdb-fault" ./bin/torture \
+  --iterations 100 --seed 42 --mode recovery-crash \
+  --json-report artifacts/judge-recovery.json
+KVDB_FAULT_EXECUTABLE="$PWD/kvdb-fault" ./bin/torture \
+  --iterations 100 --seed 7 --mode compaction \
+  --json-report artifacts/judge-compaction.json
+```
+
+The campaign exits `0` only when no campaign failure is recorded. Each run
+prints its final JSON report and writes a Markdown report beside the requested
+JSON path. A seeded run is reproducible for the same executable, platform, and
+seed; a different seed is intentionally a different workload. The random-crash
+mode uses real child-process termination and restart. The recovery and
+compaction modes use the separately built fault-injection executable.
+
 Crash, recovery-interruption, compaction-interruption, and deterministic
 injected-ENOSPC modes are separate real-binary modes. They remain distinct from
 simulator-only faults and from physical disk exhaustion.
