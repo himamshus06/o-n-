@@ -4,27 +4,7 @@ This document describes the implementation in `src/kvdb` and `src/cmd/kvdb`, not
 
 ## A. Runtime architecture and ordering
 
-```text
-CLI handlers: open put get del batch dump check serve
-JSONL server: stdin requests -> stdout JSON responses; READY/diagnostics -> stderr
-                         |
-                         v
- DB API (src/kvdb/db.go) -- DB.mu (RWMutex) -- committed values map[string][]byte
-       | Get returns a copy; Batch holds the write lock for one logical batch
-       | maxBytes complete-transaction preflight
-       v
- storage.mu (storage.go) -- append-only authoritative file
-       | validate/serialize diskRecord -> 4-byte little-endian length -> JSON
-       | operation frames -> commit frame -> File.Sync()
-       | success: DB applies every operation -> CLI/JSONL reports success/ACK
-       | failure: truncate/seek/Sync rollback; uncertain sync poisons storage
-       v
- Open: candidate selection -> checkpoint/legacy recovery -> index
- Compact: DB write lock + snapshot/tx boundary -> KVCPv003 .compact-tmp
-          -> Sync, close, reopen, independent validation
-          -> Windows ReplaceFileW or portable rename/restore
-          -> reopen authoritative -> remove backup -> best-effort directory sync
-```
+![Runtime Architecture](architecture.svg)
 
 For a write, `DB.Batch` validates all operations, then `storage.commit` serializes the complete group, checks `maxBytes`, writes operation frames, writes one commit frame, and calls `File.Sync`. Only after that returns does `DB.Batch` apply the operations to the in-memory map. The serve loop writes an ACK/success response only after the DB method returns. A failed append attempts truncate, seek, and sync; a sync failure poisons storage even if rollback appears to succeed, so later writes return recovery-required/UNKNOWN rather than pretending the outcome is known.
 
