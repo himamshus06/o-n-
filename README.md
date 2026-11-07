@@ -228,6 +228,71 @@ The simple command-line `put`, `get`, and `del` interface is
 text-oriented. Use the JSONL protocol to represent arbitrary key and
 value bytes.
 
+### Quick demo with a fresh database
+
+The following self-contained examples create a disposable database, write
+sample values, exercise CRUD and batch operations, validate the file, and
+reopen it to verify persistence. Do not replace the temporary path with an
+important existing database path.
+
+On WSL/Linux:
+
+```bash
+DEMO_DIR="$(mktemp -d /tmp/kvdb-demo-XXXXXX)"
+DB="$DEMO_DIR/demo.kv"
+BATCH_FILE="$DEMO_DIR/batch.txt"
+
+printf 'PUT beta two\nPUT alpha one\nDELETE missing\n' > "$BATCH_FILE"
+
+go build -o kvdb ./src/cmd/kvdb
+./kvdb open "$DB"
+./kvdb put "$DB" greeting hello
+./kvdb get "$DB" greeting
+./kvdb del "$DB" greeting
+./kvdb get "$DB" greeting
+./kvdb batch "$DB" "$BATCH_FILE"
+./kvdb dump "$DB"
+./kvdb check "$DB"
+./kvdb open "$DB"
+
+rm -rf "$DEMO_DIR"
+```
+
+Expected highlights are `OK` for successful writes and deletes,
+`NOTFOUND` after deleting `greeting`, a sorted dump containing `alpha one` and
+`beta two`, and `OK` from `check`. The final `open` demonstrates that the
+committed data can be recovered after a separate process invocation.
+
+On Windows PowerShell:
+
+```powershell
+$DemoDir = Join-Path $env:TEMP ("kvdb-demo-" + [guid]::NewGuid().ToString("N"))
+New-Item -ItemType Directory -Path $DemoDir | Out-Null
+$DB = Join-Path $DemoDir "demo.kv"
+$BatchFile = Join-Path $DemoDir "batch.txt"
+@"
+PUT beta two
+PUT alpha one
+DELETE missing
+"@ | Set-Content $BatchFile
+
+go build -o kvdb.exe ./src/cmd/kvdb
+.\kvdb.exe open $DB
+.\kvdb.exe put $DB greeting hello
+.\kvdb.exe get $DB greeting
+.\kvdb.exe del $DB greeting
+.\kvdb.exe get $DB greeting
+.\kvdb.exe batch $DB $BatchFile
+.\kvdb.exe dump $DB
+.\kvdb.exe check $DB
+.\kvdb.exe open $DB
+
+Remove-Item -LiteralPath $DemoDir -Recurse -Force
+```
+
+The cleanup command removes only the temporary demo directory created by the
+example.
+
 ## JSON Lines server protocol
 
 Start the long-running server with:
