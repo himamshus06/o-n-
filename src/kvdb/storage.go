@@ -143,6 +143,9 @@ func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, 
 	// is the only known-good copy.
 	_ = os.Remove(tmp)
 	committed := map[string]diskRecord{}
+	if count, ok := checkpointEntryCountHint(s.f); ok {
+		committed = make(map[string]diskRecord, count)
+	}
 	if err := s.recover(committed); err != nil {
 		_ = f.Close()
 		return nil, nil, err
@@ -150,6 +153,26 @@ func openStorage(path string, maxBytes int64) (*storage, map[string]diskRecord, 
 	_ = os.Remove(backup)
 	_ = syncDir(filepath.Dir(path))
 	return s, committed, nil
+}
+
+// checkpointEntryCountHint is only a bounded allocation hint. The complete
+// checkpoint parser still validates all checksums, bounds, ordering, and
+// metadata before inserting entries into the index.
+func checkpointEntryCountHint(f storageFile) (int, bool) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, false
+	}
+	var header [checkpointHeaderSize]byte
+	_, err := io.ReadFull(f, header[:])
+	_, _ = f.Seek(0, io.SeekStart)
+	if err != nil || string(header[:8]) != checkpointMagic {
+		return 0, false
+	}
+	count := binary.LittleEndian.Uint64(header[28:36])
+	if count > maxCheckpointEntries {
+		return 0, false
+	}
+	return int(count), true
 }
 
 // validStorageCandidate validates a candidate without selecting it. Complete
@@ -167,6 +190,9 @@ func validStorageCandidate(path string) (valid, exists bool) {
 	var magic [8]byte
 	if _, err = io.ReadFull(f, magic[:]); err == nil && string(magic[:]) == checkpointMagic {
 		index := map[string]diskRecord{}
+		if count, ok := checkpointEntryCountHint(s.f); ok {
+			index = make(map[string]diskRecord, count)
+		}
 		var tx uint64
 		var end int64
 		_, err = f.Seek(0, io.SeekStart)
@@ -534,9 +560,16 @@ func writeFull(w io.Writer, b []byte) error {
 	return nil
 }
 
-func (s *storage) commit(ops []Operation) error {
+func (s *storage) commit(ops []Operation) (err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	entered := false
+	var probeTx uint64
+	defer func() {
+		if entered && err != nil {
+			crashProbeEvent("STORAGE_COMMIT_ERROR", probeTx)
+		}
+	}()
 	if s.f == nil {
 		return ErrClosed
 	}
@@ -547,6 +580,9 @@ func (s *storage) commit(ops []Operation) error {
 		return errors.New("transaction ID space exhausted")
 	}
 	tx := s.nextTx + 1
+	probeTx = tx
+	entered = true
+	crashProbeEvent("STORAGE_COMMIT_ENTER", tx)
 	var transactionSize int64
 	for _, op := range ops {
 		rec := diskRecord{TxID: tx, Type: op.Type, Key: append([]byte(nil), op.Key...), Value: append([]byte(nil), op.Value...)}
@@ -574,6 +610,7 @@ func (s *storage) commit(ops []Operation) error {
 		return err
 	}
 	faultInjectionPoint("before-operation-write")
+	crashProbeEvent("STORAGE_APPEND_BEGIN", tx)
 	var wrote bool
 	for _, op := range ops {
 		rec := diskRecord{TxID: tx, Type: op.Type, Key: append([]byte(nil), op.Key...), Value: append([]byte(nil), op.Value...)}
@@ -594,13 +631,17 @@ func (s *storage) commit(ops []Operation) error {
 	if err := writeFull(s.f, commitFrame); err != nil {
 		return s.rollbackAfterFailure(start, err, false)
 	}
+	crashProbeEvent("STORAGE_COMMIT_RECORD_WRITTEN", tx)
 	faultInjectionPoint("after-commit-marker")
 	faultInjectionPoint("before-sync")
+	crashProbeEvent("STORAGE_SYNC_BEGIN", tx)
 	if err := s.f.Sync(); err != nil {
 		return s.rollbackAfterFailure(start, err, true)
 	}
+	crashProbeEvent("STORAGE_SYNC_COMPLETE", tx)
 	faultInjectionPoint("after-sync")
 	s.nextTx = tx
+	crashProbeEvent("STORAGE_COMMIT_EXIT", tx)
 	return nil
 }
 
@@ -624,22 +665,34 @@ func (s *storage) rollbackAfterFailure(start int64, cause error, poison bool) er
 func (s *storage) close() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	crashProbeEvent("STORAGE_CLOSE_ENTER", 0)
 	if s.f == nil {
+		crashProbeEvent("STORAGE_CLOSE_EXIT", 0)
 		return nil
 	}
 	var syncErr error
 	if !s.poisoned {
+		crashProbeEvent("STORAGE_CLOSE_SYNC_BEGIN", 0)
 		syncErr = s.f.Sync()
 		if syncErr != nil {
 			s.poisoned = true
+			crashProbeEvent("STORAGE_CLOSE_ERROR", 0)
+		} else {
+			crashProbeEvent("STORAGE_CLOSE_SYNC_COMPLETE", 0)
 		}
 	}
+	crashProbeEvent("STORAGE_CLOSE_FILE_CLOSE_BEGIN", 0)
 	closeErr := s.f.Close()
 	s.f = nil
 	if syncErr != nil {
 		return syncErr
 	}
-	return closeErr
+	if closeErr != nil {
+		crashProbeEvent("STORAGE_CLOSE_ERROR", 0)
+		return closeErr
+	}
+	crashProbeEvent("STORAGE_CLOSE_EXIT", 0)
+	return nil
 }
 
 func (s *storage) check() error {
@@ -659,6 +712,9 @@ func (s *storage) check() error {
 		// Reuse the authoritative checkpoint parser, then validate only the
 		// append-only records after the validated checkpoint boundary.
 		index := map[string]diskRecord{}
+		if count, ok := checkpointEntryCountHint(s.f); ok {
+			index = make(map[string]diskRecord, count)
+		}
 		if _, err := s.f.Seek(0, io.SeekStart); err != nil {
 			return err
 		}
