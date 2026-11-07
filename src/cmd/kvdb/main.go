@@ -383,6 +383,9 @@ func validateEncodedKey(s string) error {
 	if err != nil {
 		return fmt.Errorf("Invalid Base64 key")
 	}
+	if len(b) == 0 {
+		return fmt.Errorf("key must contain between 1 and 1024 bytes")
+	}
 	if len(b) > 1024 {
 		return fmt.Errorf("key exceeds 1024 bytes")
 	}

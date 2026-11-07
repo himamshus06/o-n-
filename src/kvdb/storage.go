@@ -406,7 +406,7 @@ func (s *storage) loadCheckpoint(index map[string]diskRecord) (int64, uint64, er
 		keyLen := int(binary.LittleEndian.Uint32(payload[pos : pos+4]))
 		valueLen := int(binary.LittleEndian.Uint32(payload[pos+4 : pos+8]))
 		pos += 8
-		if keyLen > 1024 || valueLen > 1<<20 || keyLen > len(payload)-pos || valueLen > len(payload)-pos-keyLen {
+		if keyLen == 0 || keyLen > 1024 || valueLen > 1<<20 || keyLen > len(payload)-pos || valueLen > len(payload)-pos-keyLen {
 			return 0, 0, fmt.Errorf("checkpoint entry bounds invalid")
 		}
 		key := payload[pos : pos+keyLen]
@@ -438,7 +438,7 @@ func makeCheckpoint(values map[string][]byte, txID uint64, generation uint64) ([
 	payload := make([]byte, 0)
 	for _, key := range keys {
 		value := values[key]
-		if len(key) > 1024 || len(value) > 1<<20 {
+		if len(key) == 0 || len(key) > 1024 || len(value) > 1<<20 {
 			return nil, fmt.Errorf("checkpoint entry exceeds limit")
 		}
 		var lens [8]byte
@@ -499,6 +499,9 @@ func validateRecord(rec diskRecord) error {
 	}
 	if rec.Type != Put && rec.Type != Delete {
 		return fmt.Errorf("unknown operation type %d", rec.Type)
+	}
+	if len(rec.Key) == 0 {
+		return errors.New("key must contain between 1 and 1024 bytes")
 	}
 	if len(rec.Key) > 1024 {
 		return errors.New("key exceeds 1024 bytes")
