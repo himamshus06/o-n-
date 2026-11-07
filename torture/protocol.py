@@ -72,8 +72,8 @@ class PutRequest:
 
     def __post_init__(self) -> None:
         validate_request_id(self.request_id)
-        if not isinstance(self.key, bytes) or len(self.key) > MAX_KEY_SIZE:
-            raise ProtocolValidationError("key must be bytes of at most 1024 bytes")
+        if not isinstance(self.key, bytes) or not 1 <= len(self.key) <= MAX_KEY_SIZE:
+            raise ProtocolValidationError("key must contain between 1 and 1024 bytes")
         if not isinstance(self.value, bytes) or len(self.value) > MAX_VALUE_SIZE:
             raise ProtocolValidationError("value must be bytes of at most 1 MB")
 
@@ -89,8 +89,8 @@ class GetRequest:
 
     def __post_init__(self) -> None:
         validate_request_id(self.request_id)
-        if not isinstance(self.key, bytes) or len(self.key) > MAX_KEY_SIZE:
-            raise ProtocolValidationError("key must be bytes of at most 1024 bytes")
+        if not isinstance(self.key, bytes) or not 1 <= len(self.key) <= MAX_KEY_SIZE:
+            raise ProtocolValidationError("key must contain between 1 and 1024 bytes")
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.request_id, "op": "GET", "key": encode_bytes(self.key, field="key")}
@@ -104,8 +104,8 @@ class DeleteRequest:
 
     def __post_init__(self) -> None:
         validate_request_id(self.request_id)
-        if not isinstance(self.key, bytes) or len(self.key) > MAX_KEY_SIZE:
-            raise ProtocolValidationError("key must be bytes of at most 1024 bytes")
+        if not isinstance(self.key, bytes) or not 1 <= len(self.key) <= MAX_KEY_SIZE:
+            raise ProtocolValidationError("key must contain between 1 and 1024 bytes")
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.request_id, "op": "DELETE", "key": encode_bytes(self.key, field="key")}
@@ -213,8 +213,8 @@ class DumpResponse(DatabaseResponse):
     def __post_init__(self) -> None:
         super(DumpResponse, self).__post_init__()
         for key, value in self.entries:
-            if not isinstance(key, bytes) or len(key) > MAX_KEY_SIZE:
-                raise ProtocolValidationError("DUMP key exceeds the 1024-byte limit")
+            if not isinstance(key, bytes) or not 1 <= len(key) <= MAX_KEY_SIZE:
+                raise ProtocolValidationError("DUMP key must contain between 1 and 1024 bytes")
             if not isinstance(value, bytes) or len(value) > MAX_VALUE_SIZE:
                 raise ProtocolValidationError("DUMP value exceeds the 1 MB limit")
 

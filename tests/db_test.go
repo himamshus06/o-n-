@@ -56,6 +56,41 @@ func TestBatchLastOperationWins(t *testing.T) {
 	}
 }
 
+func TestKeyLengthBoundariesAndEmptyKeyRejection(t *testing.T) {
+	db, err := kvdb.Open(filepath.Join(t.TempDir(), "db.kv"), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err = db.Put(nil, []byte("value")); err == nil {
+		t.Fatal("accepted empty-key PUT")
+	}
+	if _, err = db.Get(nil); err == nil {
+		t.Fatal("accepted empty-key GET")
+	}
+	if err = db.Delete(nil); err == nil {
+		t.Fatal("accepted empty-key DELETE")
+	}
+	if err = db.Put([]byte("a"), []byte("one")); err != nil {
+		t.Fatal(err)
+	}
+	if err = db.Batch([]kvdb.Operation{
+		{Type: kvdb.Put, Key: nil, Value: []byte("bad")},
+		{Type: kvdb.Put, Key: []byte("not-applied"), Value: []byte("bad")},
+	}); err == nil {
+		t.Fatal("accepted batch containing empty key")
+	}
+	if _, err = db.Get([]byte("not-applied")); !errors.Is(err, kvdb.ErrNotFound) {
+		t.Fatalf("rejected batch partially applied: %v", err)
+	}
+	if err = db.Put([]byte("b"), []byte{}); err != nil {
+		t.Fatalf("empty value rejected: %v", err)
+	}
+	if err = db.Put(make([]byte, 1024), []byte("max")); err != nil {
+		t.Fatalf("1024-byte key rejected: %v", err)
+	}
+}
+
 func TestCompactPreservesLiveValuesAndReopens(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "db.kv")
 	db, err := kvdb.Open(p, 0)

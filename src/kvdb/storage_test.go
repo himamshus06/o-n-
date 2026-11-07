@@ -222,6 +222,25 @@ func TestRecordValidationRejectsMalformedFrames(t *testing.T) {
 	}
 }
 
+func TestEmptyKeysRejectedByRecordAndCheckpointValidation(t *testing.T) {
+	for _, record := range []diskRecord{
+		{TxID: 1, Type: Put, Key: nil, Value: []byte("v")},
+		{TxID: 1, Type: Delete, Key: nil},
+	} {
+		if err := validateRecord(record); err == nil {
+			t.Fatalf("validateRecord accepted empty key for type %d", record.Type)
+		}
+	}
+
+	frame, err := makeCheckpoint(map[string][]byte{"": []byte("v")}, 1, 1)
+	if err == nil {
+		t.Fatal("makeCheckpoint accepted an empty key")
+	}
+	if frame != nil {
+		t.Fatal("makeCheckpoint returned a frame after rejecting an empty key")
+	}
+}
+
 func TestCRC32CUsesCastagnoliPolynomial(t *testing.T) {
 	if got := crc32.Checksum([]byte("123456789"), castagnoliTable); got != 0xe3069283 {
 		t.Fatalf("CRC32C = %#08x, want 0xe3069283", got)
